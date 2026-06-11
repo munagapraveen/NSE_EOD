@@ -1,0 +1,134 @@
+from nicegui import ui
+from sqlalchemy import func
+from src.db.engine import SessionLocal
+from src.models import Security, SyncLog
+
+NAV_ITEMS = [
+    {"id": "dashboard",        "label": "Dashboard",          "icon": "dashboard",      "route": "/"},
+    {"id": "stocks",           "label": "Stocks",             "icon": "trending_up",    "route": "/stocks"},
+    {"id": "indexes",          "label": "Indexes",            "icon": "show_chart",     "route": "/indexes"},
+    {"id": "etfs",             "label": "ETFs",               "icon": "account_balance","route": "/etfs"},
+    {"id": "download",         "label": "Download Manager",   "icon": "cloud_download", "route": "/download"},
+    {"id": "corporate_actions","label": "Corporate Actions",  "icon": "swap_horiz",     "route": "/corporate-actions"},
+    {"id": "symbol_changes",   "label": "Symbol Changes",     "icon": "find_replace",   "route": "/symbol-changes"},
+    {"id": "screener",         "label": "Sharpe Screener",    "icon": "filter_alt",     "route": "/screener"},
+    {"id": "settings",         "label": "Settings",           "icon": "settings",       "route": "/settings"},
+]
+
+def get_db_stats():
+    session = SessionLocal()
+    try:
+        total_stocks = session.query(func.count(Security.id)).filter(Security.security_type == 'STOCK').scalar() or 0
+        total_etfs = session.query(func.count(Security.id)).filter(Security.security_type == 'ETF').scalar() or 0
+        
+        last_log = session.query(SyncLog).filter(SyncLog.status == 'SUCCESS').order_by(SyncLog.completed_at.desc()).first()
+        last_sync = last_log.completed_at.strftime("%d-%b-%Y %H:%M") if last_log else "Never"
+        
+        return total_stocks, total_etfs, last_sync
+    except Exception as e:
+        return 0, 0, "Error"
+    finally:
+        session.close()
+
+
+def check_db_integrity() -> tuple[bool, str]:
+    """
+    Check if the database is accessible and consistent.
+    Returns (is_corrupt, error_message).
+    """
+    import os
+    from config.settings import settings
+    from loguru import logger
+    
+    db_url = settings.database_url
+    if not db_url.startswith("duckdb:///"):
+        return False, ""
+        
+    db_file_path = db_url.replace("duckdb:///", "")
+    if not os.path.exists(db_file_path):
+        return True, "Database file does not exist."
+        
+    session = SessionLocal()
+    try:
+        # Perform test queries that trigger index lookups/scans
+        session.query(func.count(Security.id)).scalar()
+        session.query(SyncLog).first()
+        return False, ""
+    except Exception as e:
+        logger.error(f"Database integrity check failed: {e}")
+        return True, str(e)
+    finally:
+        session.close()
+
+def create_layout(active: str = "dashboard"):
+    """Create the shared layout with sidebar navigation."""
+    
+    total_stocks, total_etfs, last_sync = get_db_stats()
+    
+    # Check database integrity and display alert if corrupted
+    is_corrupt, err_msg = check_db_integrity()
+    if is_corrupt:
+        with ui.row().classes("w-full bg-red-950/40 border border-red-500/30 p-4 rounded-lg items-center gap-4 mb-4"):
+            ui.icon("warning", color="red").classes("text-3xl")
+            with ui.column().classes("gap-1 flex-1"):
+                ui.label("DATABASE INCONSISTENCY OR CORRUPTION DETECTED").classes("text-red-400 font-bold text-sm tracking-wide")
+                ui.label(
+                    f"Error details: {err_msg}. This typically happens due to an abrupt application crash or force-kill. "
+                    "You do not need to redownload your data. Rebuilding the database indexes will restore full database integrity."
+                ).classes("text-slate-300 text-xs")
+            with ui.row().classes("gap-3"):
+                ui.button("Go to Settings & Repair", on_click=lambda: ui.navigate.to("/settings")) \
+                    .props("unelevated color=red") \
+                    .classes("px-4 py-1.5 text-xs text-white font-semibold rounded-lg")
+
+    
+    with ui.header().classes("bg-[#1a1a2e] border-b border-white/10 items-center justify-between px-6 py-3"):
+        with ui.row().classes("items-center gap-3"):
+            ui.icon("show_chart").classes("text-indigo-400 text-3xl")
+            ui.label("NSE Data Manager").classes("text-xl font-bold text-white")
+            
+        with ui.row().classes("items-center gap-4"):
+            # Global Stock Search box
+            search_input = ui.input(placeholder="Quick search... (Press Enter)") \
+                .props('outlined dense dark') \
+                .classes("w-64 bg-[#2a2a3e] rounded-lg")
+            
+            async def handle_search():
+                val = search_input.value.strip().upper()
+                if val:
+                    session = SessionLocal()
+                    try:
+                        sec = session.query(Security).filter(Security.symbol == val).first()
+                        if sec:
+                            ui.navigate.to(f"/stocks/{val}")
+                            search_input.set_value("")
+                        else:
+                            ui.notify(f"Symbol {val} not found in database", type="warning")
+                    finally:
+                        session.close()
+            
+            search_input.on("keydown.enter", handle_search)
+            
+            # Simple dark mode toggle visualization
+            ui.icon("dark_mode").classes("text-white text-2xl")
+            
+    with ui.left_drawer().classes("bg-[#1a1a2e] border-r border-white/10 p-0").props("width=240"):
+        ui.label("NAVIGATION").classes("text-xs text-gray-500 font-semibold px-6 py-4 mt-2 tracking-wider")
+        
+        for item in NAV_ITEMS:
+            is_active = item["id"] == active
+            with ui.row().classes(
+                f"sidebar-item w-full items-center gap-3 px-6 py-3 cursor-pointer "
+                f"{'active' if is_active else ''}"
+            ).on("click", lambda _, r=item["route"]: ui.navigate.to(r)):
+                ui.icon(item["icon"]).classes(
+                    f"text-xl {'text-indigo-400' if is_active else 'text-gray-400'}"
+                )
+                ui.label(item["label"]).classes(
+                    f"text-sm {'text-white font-semibold' if is_active else 'text-gray-400'}"
+                )
+                
+    with ui.footer().classes("bg-[#1a1a2e] border-t border-white/10 py-2"):
+        with ui.row().classes("w-full items-center justify-between px-6"):
+            ui.label(f"Last Sync: {last_sync}").classes("text-xs text-gray-500")
+            ui.label(f"Stocks: {total_stocks} | ETFs: {total_etfs}").classes("text-xs text-gray-500")

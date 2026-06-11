@@ -1,0 +1,100 @@
+import os
+from datetime import date
+from nicegui import ui
+
+from config.settings import settings
+
+
+def save_env_settings(db_url: str, start_date_str: str, delay: float, native: bool, dark: bool):
+    """Overwrite the .env file with updated settings values."""
+    env_path = ".env"
+    
+    # Compile new env content
+    lines = [
+        f"DATABASE_URL={db_url}\n",
+        f"NSE_START_DATE={start_date_str}\n",
+        f"NSE_REQUEST_DELAY_SECONDS={delay}\n",
+        f"APP_TITLE={settings.app_title}\n",
+        f"APP_HOST={settings.app_host}\n",
+        f"APP_PORT={settings.app_port}\n",
+        f"APP_NATIVE={str(native).upper()}\n",
+        f"APP_DARK_MODE={str(dark).upper()}\n",
+        f"LOG_LEVEL={settings.log_level}\n",
+    ]
+    
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+            
+        # Update settings in-memory
+        settings.database_url = db_url
+        settings.nse_start_date = date.fromisoformat(start_date_str)
+        settings.nse_request_delay_seconds = delay
+        settings.app_native = native
+        settings.app_dark_mode = dark
+        
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save settings: {e}")
+        return False
+
+
+def render():
+    """Render the Settings page."""
+    
+    with ui.column().classes("w-full gap-6 p-6"):
+        # Page Title
+        with ui.column().classes("gap-1"):
+            ui.label("Application Settings").classes("text-3xl font-bold text-white")
+            ui.label("Configure database connection string, ingestion delays, and display preferences.").classes("text-sm text-slate-400")
+
+        # Config Panel
+        with ui.card().classes("glass-card w-full gap-6 max-w-3xl"):
+            ui.label("Database & Connection Configuration").classes("text-lg font-bold text-white mb-2")
+            
+            # Database connection URL
+            db_input = ui.input(label="Database URL", value=settings.database_url) \
+                .props("outlined dark") \
+                .classes("w-full")
+            ui.label("Default DuckDB path: 'duckdb:///data/market.db'. Change to a postgresql:// URL for cloud migration.").classes("text-xs text-slate-500 -mt-4")
+
+            ui.label("Ingestion & Rate Limit Parameters").classes("text-lg font-bold text-white mb-2 mt-4")
+            
+            with ui.row().classes("w-full gap-6 wrap"):
+                # NSE start date
+                start_date_input = ui.input(label="Download Start Date", value=settings.nse_start_date.strftime("%Y-%m-%d")) \
+                    .props("outlined dark type=date") \
+                    .classes("w-64")
+                    
+                # Request delay
+                delay_input = ui.number(label="Request Delay (seconds)", value=settings.nse_request_delay_seconds, format="%.1f") \
+                    .props("outlined dark step=0.5 min=1.0") \
+                    .classes("w-64")
+            ui.label("A delay of 3.0s is recommended to prevent your IP from being rate-limited or blocked by NSE India.").classes("text-xs text-slate-500 -mt-4")
+
+            ui.label("Window & Display Options").classes("text-lg font-bold text-white mb-2 mt-4")
+            
+            with ui.row().classes("w-full gap-6 wrap"):
+                native_cb = ui.checkbox("Launch as Desktop App Window (Native Mode)", value=settings.app_native).props("dark")
+                dark_cb = ui.checkbox("Enable Dark Mode by Default", value=settings.app_dark_mode).props("dark")
+            
+            # Action Button
+            with ui.row().classes("w-full mt-6 justify-end"):
+                save_btn = ui.button("Save Settings", icon="save") \
+                    .props('unelevated color=indigo') \
+                    .classes("px-6 py-2 text-white font-semibold rounded-lg")
+                    
+            async def handle_save():
+                success = save_env_settings(
+                    db_input.value.strip(),
+                    start_date_input.value,
+                    float(delay_input.value),
+                    native_cb.value,
+                    dark_cb.value
+                )
+                if success:
+                    ui.notify("Settings saved successfully! Restart application to apply environment shifts.", type="positive")
+                else:
+                    ui.notify("Failed to save settings to .env file.", type="negative")
+                    
+            save_btn.on("click", handle_save)

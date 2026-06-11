@@ -1,0 +1,243 @@
+from datetime import date
+import asyncio
+from sqlalchemy import select, delete
+from sqlalchemy.orm import Session
+from loguru import logger
+
+from src.models import Security, RawPrice, AdjustedPrice, MarketCap
+
+
+async def calculate_historical_market_cap(session: Session, security_id: int, current_issued_shares: int) -> int:
+    """
+    Calculate historical market cap for a specific stock by reverse-engineering
+    historical shares outstanding using the price adjustment factor.
+    
+    Returns:
+        Number of market cap records written.
+    """
+    if not current_issued_shares or current_issued_shares <= 0:
+        logger.warning(f"Skipping market cap for security ID {security_id}: no valid current issued shares.")
+        return 0
+
+    # 1. Fetch raw close prices and their corresponding adjustment factors by joining raw_prices and adjusted_prices
+    query = (
+        select(RawPrice.trade_date, RawPrice.close, AdjustedPrice.adjustment_factor)
+        .join(
+            AdjustedPrice,
+            (RawPrice.security_id == AdjustedPrice.security_id) & (RawPrice.trade_date == AdjustedPrice.trade_date)
+        )
+        .where(RawPrice.security_id == security_id)
+        .order_by(RawPrice.trade_date.asc())
+    )
+    
+    results = session.execute(query).all()
+    if not results:
+        return 0
+
+    records = []
+    for row in results:
+        trade_date = row.trade_date
+        raw_close = float(row.close)
+        factor = float(row.adjustment_factor)
+
+        # Handle edge cases where factor is invalid or zero (should not happen)
+        if factor <= 0:
+            factor = 1.0
+
+        # Reverse-engineer shares outstanding: historical = current / cumulative_factor
+        historical_shares = int(round(current_issued_shares / factor))
+        mcap_value = round(historical_shares * raw_close, 2)
+
+        records.append({
+            "security_id": security_id,
+            "trade_date": trade_date,
+            "close_price": raw_close,
+            "issued_shares": historical_shares,
+            "market_cap": mcap_value,
+            "shares_source": "REVERSE_ENGINEERED"
+        })
+
+    # 2. Delete existing records for this security
+    session.execute(
+        delete(MarketCap).where(MarketCap.security_id == security_id)
+    )
+
+    if records:
+        session.bulk_insert_mappings(MarketCap, records)
+        session.commit()
+
+    logger.debug(
+        f"Calculated historical market cap for security ID {security_id}: "
+        f"{len(records)} records saved (source: REVERSE_ENGINEERED)."
+    )
+    return len(records)
+
+
+async def calculate_incremental_market_cap(
+    session: Session, security_id: int, trade_date: date, raw_close: float, last_known_shares: int
+) -> bool:
+    """
+    Calculate and insert/update market cap for a single day during daily incremental updates.
+    
+    Returns:
+        True if successfully written.
+    """
+    if not last_known_shares or last_known_shares <= 0:
+        return False
+
+    mcap_value = round(last_known_shares * float(raw_close), 2)
+    
+    # Check if record already exists
+    existing = session.execute(
+        select(MarketCap)
+        .where(MarketCap.security_id == security_id)
+        .where(MarketCap.trade_date == trade_date)
+    ).scalar_one_or_none()
+
+    if existing:
+        existing.close_price = round(float(raw_close), 2)
+        existing.issued_shares = last_known_shares
+        existing.market_cap = mcap_value
+        existing.shares_source = "NSE_QUOTE"
+    else:
+        new_record = MarketCap(
+            security_id=security_id,
+            trade_date=trade_date,
+            close_price=round(float(raw_close), 2),
+            issued_shares=last_known_shares,
+            market_cap=mcap_value,
+            shares_source="NSE_QUOTE"
+        )
+        session.add(new_record)
+
+    session.commit()
+    return True
+
+
+async def calculate_all_historical_market_caps(session: Session) -> int:
+    """
+    Calculate historical market cap for all active stocks in the database.
+    Only calculated for security_type == 'STOCK'.
+    
+    Returns:
+        Total number of market cap records written.
+    """
+    logger.info("Starting global historical market cap calculation...")
+    
+    # Fetch all stocks that have issued shares populated
+    stocks = session.execute(
+        select(Security.id, Security.symbol, Security.issued_shares)
+        .where(Security.security_type == "STOCK")
+        .where(Security.is_active == True)
+        .where(Security.is_delisted == False)
+    ).all()
+
+    total_written = 0
+    for stock in stocks:
+        try:
+            if stock.issued_shares:
+                written = await calculate_historical_market_cap(
+                    session, stock.id, stock.issued_shares
+                )
+                total_written += written
+            else:
+                logger.warning(f"Stock {stock.symbol} (ID: {stock.id}) has NULL issued_shares. Skipping.")
+        except Exception as e:
+            logger.error(f"Failed to calculate market cap for stock {stock.symbol} (ID: {stock.id}): {e}")
+            session.rollback()
+        await asyncio.sleep(0.01)
+
+    logger.info(f"Global historical market cap calculation completed. Total records written: {total_written}")
+    return total_written
+
+
+async def calculate_incremental_market_caps_for_range(session: Session, start_date: date, end_date: date) -> int:
+    """
+    Calculate market caps incrementally for a date range.
+    Recalculates full history for stocks that had splits/bonuses ex-dating in this range.
+    For all other stocks, calculates market cap only for the new dates.
+    """
+    from src.models import CorporateAction
+
+    # 1. Find stocks with corporate actions ex-dating in this range
+    actions_query = (
+        select(CorporateAction.security_id)
+        .where(CorporateAction.ex_date >= start_date)
+        .where(CorporateAction.ex_date <= end_date)
+        .where(CorporateAction.action_type.in_(["SPLIT", "BONUS"]))
+    )
+    affected_sec_ids = set(session.execute(actions_query).scalars().all())
+
+    # 2. Recalculate full history for affected stocks
+    total_written = 0
+    stocks_query = (
+        select(Security.id, Security.symbol, Security.issued_shares)
+        .where(Security.security_type == "STOCK")
+        .where(Security.is_active == True)
+        .where(Security.is_delisted == False)
+    )
+    stocks = session.execute(stocks_query).all()
+    stock_shares_map = {s.id: s.issued_shares for s in stocks if s.issued_shares}
+
+    for stock_id in affected_sec_ids:
+        shares = stock_shares_map.get(stock_id)
+        if shares:
+            written = await calculate_historical_market_cap(session, stock_id, shares)
+            total_written += written
+        await asyncio.sleep(0.01)
+
+    # 3. For all other stocks, calculate market cap only for the new dates
+    query = (
+        select(
+            RawPrice.security_id,
+            RawPrice.trade_date,
+            RawPrice.close,
+            AdjustedPrice.adjustment_factor
+        )
+        .join(
+            AdjustedPrice,
+            (RawPrice.security_id == AdjustedPrice.security_id) & (RawPrice.trade_date == AdjustedPrice.trade_date)
+        )
+        .where(RawPrice.trade_date >= start_date)
+        .where(RawPrice.trade_date <= end_date)
+    )
+    if affected_sec_ids:
+        query = query.where(RawPrice.security_id.not_in(affected_sec_ids))
+
+    results = session.execute(query).all()
+    records = []
+    for row in results:
+        shares = stock_shares_map.get(row.security_id)
+        if not shares:
+            continue
+        factor = float(row.adjustment_factor) if row.adjustment_factor else 1.0
+        if factor <= 0:
+            factor = 1.0
+        historical_shares = int(round(shares / factor))
+        raw_close = float(row.close)
+        mcap_value = round(historical_shares * raw_close, 2)
+        records.append({
+            "security_id": row.security_id,
+            "trade_date": row.trade_date,
+            "close_price": raw_close,
+            "issued_shares": historical_shares,
+            "market_cap": mcap_value,
+            "shares_source": "REVERSE_ENGINEERED"
+        })
+
+    if records:
+        delete_query = (
+            delete(MarketCap)
+            .where(MarketCap.trade_date >= start_date)
+            .where(MarketCap.trade_date <= end_date)
+        )
+        if affected_sec_ids:
+            delete_query = delete_query.where(MarketCap.security_id.not_in(affected_sec_ids))
+        session.execute(delete_query)
+        session.bulk_insert_mappings(MarketCap, records)
+        session.commit()
+        total_written += len(records)
+
+    logger.info(f"Incremental market cap calculation completed. Total records written: {total_written}")
+    return total_written
+

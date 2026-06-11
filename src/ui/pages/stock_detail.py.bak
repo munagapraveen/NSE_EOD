@@ -1,0 +1,277 @@
+from datetime import date
+from sqlalchemy import select, func
+from nicegui import ui
+
+from src.db.engine import SessionLocal
+from src.models import Security, RawPrice, AdjustedPrice, Indicator, CorporateAction, MarketCap
+from src.ui.components.price_chart import create_candlestick_chart
+
+
+def get_security_details(symbol: str):
+    """Fetch security metadata, price history, and corporate actions."""
+    session = SessionLocal()
+    try:
+        sec = session.query(Security).filter(Security.symbol == symbol).first()
+        if not sec:
+            return None, [], []
+            
+        # Fetch joined price and indicator history
+        query = (
+            select(
+                RawPrice.trade_date,
+                RawPrice.open.label("raw_open"),
+                RawPrice.high.label("raw_high"),
+                RawPrice.low.label("raw_low"),
+                RawPrice.close.label("raw_close"),
+                RawPrice.volume.label("raw_volume"),
+                AdjustedPrice.adj_open,
+                AdjustedPrice.adj_high,
+                AdjustedPrice.adj_low,
+                AdjustedPrice.adj_close,
+                AdjustedPrice.adj_volume,
+                Indicator.sma_5,
+                Indicator.sma_10,
+                Indicator.sma_20,
+                Indicator.sma_50,
+                Indicator.sma_200,
+                MarketCap.market_cap
+            )
+            .outerjoin(AdjustedPrice, (RawPrice.security_id == AdjustedPrice.security_id) & (RawPrice.trade_date == AdjustedPrice.trade_date))
+            .outerjoin(Indicator, (RawPrice.security_id == Indicator.security_id) & (RawPrice.trade_date == Indicator.trade_date))
+            .outerjoin(MarketCap, (RawPrice.security_id == MarketCap.security_id) & (RawPrice.trade_date == MarketCap.trade_date))
+            .where(RawPrice.security_id == sec.id)
+            .order_by(RawPrice.trade_date.asc())
+        )
+        
+        prices = session.execute(query).all()
+        
+        # Fetch corporate actions
+        actions = session.query(CorporateAction).filter(CorporateAction.security_id == sec.id).all()
+        actions_list = [
+            {
+                "date": a.ex_date,
+                "label": f"{a.action_type} {a.bonus_ratio_new}:{a.bonus_ratio_existing}" if a.action_type == 'BONUS' else f"Split {int(a.old_face_value)}:{int(a.new_face_value)}",
+                "description": a.description
+            } for a in actions
+        ]
+        
+        return sec, prices, actions_list
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, [], []
+    finally:
+        session.close()
+
+
+def render(symbol: str):
+    """Render the stock details page for a given symbol."""
+    sec, prices, actions = get_security_details(symbol)
+    
+    if not sec:
+        with ui.column().classes("w-full items-center p-12 gap-4"):
+            ui.icon("error", size="lg").classes("text-red-500")
+            ui.label(f"Security '{symbol}' not found in database.").classes("text-lg font-bold text-white")
+            ui.button("Back to Stocks", on_click=lambda: ui.navigate.to("/stocks")).classes("bg-indigo-500 text-white")
+        return
+
+    # Extract chart data vectors
+    dates = [p.trade_date.strftime("%Y-%m-%d") for p in prices]
+    ohlc = [[float(p.adj_open), float(p.adj_close), float(p.adj_low), float(p.adj_high)] for p in prices]
+    volumes = [int(p.adj_volume) if p.adj_volume else 0 for p in prices]
+    
+    # Store indicator vectors for overlay checkbox toggle
+    all_smas = {
+        "SMA 5": [float(p.sma_5) if p.sma_5 else None for p in prices],
+        "SMA 10": [float(p.sma_10) if p.sma_10 else None for p in prices],
+        "SMA 20": [float(p.sma_20) if p.sma_20 else None for p in prices],
+        "SMA 50": [float(p.sma_50) if p.sma_50 else None for p in prices],
+        "SMA 200": [float(p.sma_200) if p.sma_200 else None for p in prices],
+    }
+
+    # Latest metrics
+    latest_price = float(prices[-1].raw_close) if prices else 0.0
+    latest_adj = float(prices[-1].adj_close) if prices else 0.0
+    latest_mcap_cr = round(float(prices[-1].market_cap) / 10000000.0, 2) if prices and prices[-1].market_cap else None
+
+    # Calculate change
+    if len(prices) >= 2:
+        prev_close = float(prices[-2].raw_close)
+        change_val = latest_price - prev_close
+        change_pct = (change_val / prev_close) * 100
+        change_str = f"{change_val:+.2f} ({change_pct:+.2f}%)"
+        change_color = "text-emerald-400" if change_val >= 0 else "text-red-400"
+    else:
+        change_str = "-"
+        change_color = "text-slate-400"
+
+    with ui.column().classes("w-full gap-6 p-6"):
+        # Back and header
+        with ui.row().classes("w-full items-center gap-4"):
+            ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to(f"/{sec.security_type.lower()}s")) \
+                .props('flat round dark') \
+                .classes("text-slate-400")
+            with ui.column().classes("gap-0"):
+                with ui.row().classes("items-center gap-3"):
+                    ui.label(sec.symbol).classes("text-3xl font-extrabold text-white")
+                    ui.badge(sec.security_type, color="indigo").classes("text-xs px-2 py-0.5")
+                    if not sec.is_active:
+                        ui.badge("INACTIVE/DELISTED", color="red").classes("text-xs")
+                ui.label(sec.company_name or "NSE Discovered Security").classes("text-md text-slate-400")
+
+        # 1. Key Metrics Cards Row
+        with ui.grid(columns=4).classes("w-full gap-4"):
+            # Close Price
+            with ui.card().classes("stat-card"):
+                ui.label("LAST CLOSE").classes("text-xs text-slate-400 font-bold")
+                ui.label(f"₹{latest_price:.2f}").classes("text-3xl font-extrabold text-white mt-1")
+                ui.label(change_str).classes(f"text-xs font-semibold mt-2 {change_color}")
+
+            # Adjusted Close Price
+            with ui.card().classes("stat-card"):
+                ui.label("ADJUSTED CLOSE").classes("text-xs text-slate-400 font-bold")
+                ui.label(f"₹{latest_adj:.2f}").classes("text-3xl font-extrabold text-white mt-1")
+                ui.label("Reflects split/bonus changes").classes("text-xs text-slate-400 mt-2")
+
+            # Market Cap Card
+            with ui.card().classes("stat-card"):
+                ui.label("MARKET CAP").classes("text-xs text-slate-400 font-bold")
+                if latest_mcap_cr:
+                    ui.label(f"₹{latest_mcap_cr:,.2f} Cr").classes("text-3xl font-extrabold text-white mt-1")
+                    ui.label("Using raw close price").classes("text-xs text-slate-400 mt-2")
+                else:
+                    ui.label("N/A").classes("text-3xl font-extrabold text-slate-500 mt-1")
+                    ui.label("Stocks only").classes("text-xs text-slate-400 mt-2")
+
+            # Industry/ISIN Card
+            with ui.card().classes("stat-card"):
+                ui.label("METADATA").classes("text-xs text-slate-400 font-bold")
+                ui.label(sec.industry or "Other").classes("text-xl font-bold text-white mt-2 truncate")
+                ui.label(f"ISIN: {sec.isin or '-'}").classes("text-xs text-indigo-400 mt-2")
+
+        # 2. Main interactive Chart Card
+        with ui.card().classes("glass-card w-full p-4"):
+            with ui.row().classes("w-full items-center justify-between px-2 mb-2"):
+                ui.label("Historical Price & Volume Chart").classes("text-lg font-bold text-white")
+                
+                # Checkboxes to toggle SMA overlay
+                with ui.row().classes("items-center gap-3"):
+                    ui.label("Overlay SMAs:").classes("text-sm text-slate-400 mr-2")
+                    sma5_cb = ui.checkbox("SMA 5").props("dark").classes("text-xs text-indigo-400")
+                    sma10_cb = ui.checkbox("SMA 10").props("dark").classes("text-xs text-indigo-400")
+                    sma20_cb = ui.checkbox("SMA 20").props("dark").classes("text-xs text-indigo-400")
+                    sma50_cb = ui.checkbox("SMA 50").props("dark").classes("text-xs text-indigo-400")
+                    sma200_cb = ui.checkbox("SMA 200").props("dark").classes("text-xs text-indigo-400")
+
+            # Chart Container
+            chart_container = ui.row().classes("w-full")
+            
+            # Function to redraw chart dynamically
+            def redraw_chart():
+                chart_container.clear()
+                active_indicators = {}
+                if sma5_cb.value: active_indicators["SMA 5"] = all_smas["SMA 5"]
+                if sma10_cb.value: active_indicators["SMA 10"] = all_smas["SMA 10"]
+                if sma20_cb.value: active_indicators["SMA 20"] = all_smas["SMA 20"]
+                if sma50_cb.value: active_indicators["SMA 50"] = all_smas["SMA 50"]
+                if sma200_cb.value: active_indicators["SMA 200"] = all_smas["SMA 200"]
+                
+                with chart_container:
+                    create_candlestick_chart(dates, ohlc, volumes, active_indicators, actions)
+            
+            # Bind change events
+            sma5_cb.on("value-change", redraw_chart)
+            sma10_cb.on("value-change", redraw_chart)
+            sma20_cb.on("value-change", redraw_chart)
+            sma50_cb.on("value-change", redraw_chart)
+            sma200_cb.on("value-change", redraw_chart)
+            
+            # Initial drawing
+            redraw_chart()
+
+        # 3. Security Details and Corporate Actions Cards Row
+        with ui.row().classes("w-full gap-6 wrap md:nowrap"):
+            # Details Card
+            with ui.card().classes("glass-card w-full md:w-1/3 gap-4"):
+                ui.label("Security Profile").classes("text-lg font-bold text-white mb-2")
+                
+                details_data = [
+                    ("ISIN Code", sec.isin or "-"),
+                    ("Company Name", sec.company_name or "-"),
+                    ("Industry Group", sec.industry or "-"),
+                    ("Listing Date", sec.listing_date.strftime("%d-%b-%Y") if sec.listing_date else "-"),
+                    ("Current Shares Outstanding", f"{sec.issued_shares:,}" if sec.issued_shares else "-"),
+                    ("Face Value (₹)", f"{sec.face_value}" if sec.face_value else "-"),
+                    ("Discovery Source", sec.data_source or "-"),
+                ]
+                
+                for label, val in details_data:
+                    with ui.row().classes("w-full justify-between py-1 border-b border-white/5"):
+                        ui.label(label).classes("text-xs text-slate-400")
+                        ui.label(str(val)).classes("text-xs text-white font-semibold truncate max-w-[180px]")
+
+            # Corporate Actions Table Card
+            with ui.card().classes("glass-card w-full md:w-2/3"):
+                ui.label("Corporate Actions History").classes("text-lg font-bold text-white mb-2")
+                if actions:
+                    columns = [
+                        {"headerName": "Ex-Date", "field": "date", "width": 120, "cellStyle": {"fontWeight": "bold"}},
+                        {"headerName": "Action Type", "field": "label", "width": 150, "cellStyle": {"color": "#f59e0b", "fontWeight": "bold"}},
+                        {"headerName": "Description", "field": "description", "width": 350}
+                    ]
+                    # Convert dates in actions for AG Grid
+                    grid_actions = [{"date": a["date"].strftime("%d-%b-%Y"), "label": a["label"], "description": a["description"]} for a in actions]
+                    ui.aggrid({
+                        "columnDefs": columns,
+                        "rowData": grid_actions,
+                        "theme": "balham-dark",
+                        "defaultColDef": {"resizable": True}
+                    }).classes("w-full h-[220px]")
+                else:
+                    ui.label("No stock splits or bonuses found for this security.").classes("text-slate-500 py-12 text-center w-full")
+
+        # 4. Historical Data Grid Card
+        with ui.card().classes("glass-card w-full"):
+            ui.label("Historical Price & Indicator Data").classes("text-lg font-bold text-white mb-4")
+            
+            # Prepare rows for grid
+            grid_rows = []
+            for p in reversed(prices): # Show latest first
+                grid_rows.append({
+                    "date": p.trade_date.strftime("%Y-%m-%d"),
+                    "raw_close": float(p.raw_close),
+                    "adj_open": float(p.adj_open) if p.adj_open else None,
+                    "adj_high": float(p.adj_high) if p.adj_high else None,
+                    "adj_low": float(p.adj_low) if p.adj_low else None,
+                    "adj_close": float(p.adj_close) if p.adj_close else None,
+                    "adj_volume": int(p.adj_volume) if p.adj_volume else None,
+                    "sma_5": float(p.sma_5) if p.sma_5 else None,
+                    "sma_10": float(p.sma_10) if p.sma_10 else None,
+                    "sma_20": float(p.sma_20) if p.sma_20 else None,
+                    "sma_50": float(p.sma_50) if p.sma_50 else None,
+                    "sma_200": float(p.sma_200) if p.sma_200 else None,
+                })
+                
+            grid_cols = [
+                {"headerName": "Date", "field": "date", "width": 110, "pinned": "left"},
+                {"headerName": "Raw Close", "field": "raw_close", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj Open", "field": "adj_open", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj High", "field": "adj_high", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj Low", "field": "adj_low", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj Close", "field": "adj_close", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj Volume", "field": "adj_volume", "width": 120, "valueFormatter": "x => x.value ? Number(x.value).toLocaleString() : '-'"},
+                {"headerName": "SMA 5", "field": "sma_5", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "SMA 10", "field": "sma_10", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "SMA 20", "field": "sma_20", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "SMA 50", "field": "sma_50", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "SMA 200", "field": "sma_200", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+            ]
+            
+            ui.aggrid({
+                "columnDefs": grid_cols,
+                "rowData": grid_rows,
+                "theme": "balham-dark",
+                "pagination": True,
+                "paginationPageSize": 15,
+                "defaultColDef": {"sortable": True, "resizable": True}
+            }).classes("w-full h-[450px] border border-white/10 rounded-lg")

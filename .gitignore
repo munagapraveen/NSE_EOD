@@ -1,0 +1,12 @@
+*.xlsx
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+*.csv
+*.log
+/backup
+/backups
+/data
+/reports
+Todo.txt

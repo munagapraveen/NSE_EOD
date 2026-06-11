@@ -1,0 +1,247 @@
+import asyncio
+import os
+from datetime import date, timedelta
+from nicegui import ui, run
+
+from src.db.engine import SessionLocal
+from src.services.nse_client import NSEClient
+from src.services.sync_manager import SyncManager
+from loguru import logger
+from sqlalchemy import func
+from src.models import RawPrice
+from config.settings import settings
+
+# Global state to prevent concurrent downloads
+_sync_task = None
+_sync_manager = None
+_log_listener_active = False
+
+
+class LogStreamer:
+    """Read logs from file and push to textarea in real time."""
+    def __init__(self, log_area):
+        self.log_area = log_area
+        self.active = False
+
+    async def start(self):
+        self.active = True
+        log_file = str(settings.log_file)
+        
+        # Ensure log file exists
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        if not os.path.exists(log_file):
+            with open(log_file, "w") as f:
+                pass
+
+        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+            # Seek to end of log
+            f.seek(0, 2)
+            while self.active:
+                try:
+                    line = f.readline()
+                    if line:
+                        # Clean color/terminal codes if any
+                        clean_line = line.strip() + "\n"
+                        self.log_area.value += clean_line
+                        # Scroll to bottom
+                        self.log_area.run_method("scrollTo", 0, 999999)
+                    else:
+                        await asyncio.sleep(0.3)
+                except Exception:
+                    # Client disconnected or UI element deleted, stop streaming
+                    self.active = False
+                    break
+
+    def stop(self):
+        self.active = False
+
+
+def get_last_updated_date():
+    """Get the maximum trade date from raw_prices."""
+    session = SessionLocal()
+    try:
+        last_date = session.query(func.max(RawPrice.trade_date)).scalar()
+        return last_date
+    except Exception as e:
+        logger.error(f"Failed to fetch last updated date: {e}")
+        return None
+    finally:
+        session.close()
+
+
+def render():
+    """Render the Download Manager page."""
+    global _sync_manager
+    if _sync_manager is None:
+        client = NSEClient()
+        _sync_manager = SyncManager(client)
+
+    # State variables
+    running = False
+    
+    # Calculate default From Date based on database contents
+    last_update = get_last_updated_date()
+    
+    if last_update is None:
+        default_from_date = date(2024, 1, 1)
+        status_info = "Database is empty. Ready for Initial Ingestion."
+        disable_from = False
+    else:
+        default_from_date = last_update + timedelta(days=1)
+        status_info = f"Last Database Update: {last_update.strftime('%d-%b-%Y')}."
+        disable_from = True
+
+    with ui.column().classes("w-full gap-6 p-6"):
+        # Page Title
+        with ui.column().classes("gap-1"):
+            ui.label("Sync Downloader").classes("text-3xl font-bold text-white")
+            ui.label("Ingest historical or daily incremental prices and corporate actions from NSE India.").classes("text-sm text-slate-400")
+
+        # Config Panel
+        with ui.card().classes("glass-card w-full gap-6"):
+            ui.label("1. Select Ingestion Settings").classes("text-lg font-bold text-white")
+            
+            with ui.row().classes("w-full gap-8 wrap items-center"):
+                # Date picker
+                with ui.row().classes("items-center gap-3"):
+                    ui.label("From Date:").classes("text-sm text-slate-400")
+                    from_input = ui.input(value=default_from_date.strftime("%Y-%m-%d")).props("outlined dense dark type=date").classes("w-40")
+                    if disable_from:
+                        from_input.disable()
+                    
+                    # Status Label next to it
+                    status_lbl_info = ui.label(status_info).classes("text-sm text-indigo-400 font-semibold ml-4")
+
+            # Checkboxes for stages
+            with ui.row().classes("w-full gap-6 mt-2 wrap"):
+                stocks_cb = ui.checkbox("Stocks (EQ/BE)", value=True).props("dark").disable()
+                etfs_cb = ui.checkbox("ETFs", value=True).props("dark").disable()
+                indexes_cb = ui.checkbox("Indexes", value=True).props("dark").disable()
+                actions_cb = ui.checkbox("Corporate Actions", value=True).props("dark").disable()
+                mcap_cb = ui.checkbox("Market Cap", value=True).props("dark").disable()
+                indicators_cb = ui.checkbox("SMA Indicators", value=True).props("dark").disable()
+
+            # Buttons
+            with ui.row().classes("w-full gap-4 mt-4"):
+                start_btn = ui.button("Start Download", icon="play_arrow") \
+                    .props('unelevated color=indigo') \
+                    .classes("px-6 py-2 text-white font-semibold rounded-lg")
+                    
+                cancel_btn = ui.button("Cancel", icon="cancel") \
+                    .props('outline color=red') \
+                    .classes("px-6 py-2 rounded-lg")
+                cancel_btn.disable()
+
+        # Progress / Status Panel
+        progress_card = ui.card().classes("glass-card w-full gap-4 hidden")
+        with progress_card:
+            ui.label("Sync Status: Running...").classes("text-md font-bold text-indigo-400").name = "status_lbl"
+            progress_bar = ui.linear_progress(value=0.0, show_value=False).props("stripe rounded color=indigo")
+            progress_lbl = ui.label("Initializing Ingestion pipeline...").classes("text-xs text-slate-400")
+
+        # Logs Console Panel
+        with ui.card().classes("glass-card w-full gap-2"):
+            ui.label("Real-time Output Log").classes("text-lg font-bold text-white")
+            log_area = ui.textarea(value="") \
+                .props('readonly dark borderless') \
+                .classes("w-full h-[320px] bg-[#14141e] text-slate-300 font-mono text-xs p-4 rounded-lg overflow-y-auto")
+
+        log_streamer = LogStreamer(log_area)
+
+        # Trigger logic
+        async def on_start():
+            nonlocal running
+            running = True
+            
+            # Disable inputs
+            from_input.disable()
+            
+            start_btn.disable()
+            cancel_btn.enable()
+            
+            # Clear logs and display progress
+            log_area.set_value("")
+            progress_card.classes(remove="hidden")
+            
+            # Setup streamer
+            asyncio.create_task(log_streamer.start())
+            
+            # Parse parameters
+            try:
+                dt_from = date.fromisoformat(from_input.value)
+                dt_to = date.today()
+            except Exception as e:
+                ui.notify(f"Invalid date range format: {e}", type="negative")
+                on_finish("FAILED", "Invalid dates")
+                return
+
+            options = {
+                "stocks": stocks_cb.value,
+                "etfs": etfs_cb.value,
+                "indexes": indexes_cb.value,
+                "corporate_actions": actions_cb.value,
+                "market_cap": mcap_cb.value,
+                "indicators": indicators_cb.value
+            }
+
+            def handle_progress(stage, percentage, msg):
+                try:
+                    progress_bar.set_value(percentage / 100.0)
+                    progress_lbl.set_text(f"[{stage}] {msg}")
+                    # Optional visual change
+                    if percentage >= 100.0:
+                        progress_card.classes("hidden")
+                except Exception:
+                    # Ignore UI update failures when client/page is reloaded or navigated away
+                    pass
+
+            # Run sync manager in background
+            session = SessionLocal()
+            try:
+                summary = await _sync_manager.run_sync(
+                    session, dt_from, dt_to, options, progress_callback=handle_progress
+                )
+                on_finish(summary["status"], summary["message"])
+            except Exception as ex:
+                logger.error(f"Ingestion pipeline failed: {ex}")
+                on_finish("FAILED", str(ex))
+            finally:
+                session.close()
+
+        def on_finish(status, message):
+            nonlocal running
+            running = False
+            log_streamer.stop()
+            
+            # Enable/Disable based on new database state
+            last_up = get_last_updated_date()
+            if last_up is None:
+                from_input.set_value("2024-01-01")
+                from_input.enable()
+                status_lbl_info.set_text("Database is empty. Ready for Initial Ingestion.")
+            else:
+                next_st = last_up + timedelta(days=1)
+                from_input.set_value(next_st.strftime("%Y-%m-%d"))
+                from_input.disable()
+                status_lbl_info.set_text(f"Last Database Update: {last_up.strftime('%d-%b-%Y')}.")
+                
+            start_btn.enable()
+            cancel_btn.disable()
+            progress_card.classes(add="hidden")
+
+            # Notify user
+            if status == "SUCCESS":
+                ui.notify("Data sync completed successfully!", type="positive")
+            elif status == "CANCELLED":
+                ui.notify("Data sync cancelled by user.", type="warning")
+            else:
+                ui.notify(f"Data sync failed: {message}", type="negative")
+
+        def on_cancel():
+            if running:
+                _sync_manager.request_cancel()
+                ui.notify("Requesting sync cancellation...", type="warning")
+
+        # Bind button clicks
+        start_btn.on("click", on_start)
+        cancel_btn.on("click", on_cancel)

@@ -1,0 +1,30 @@
+Metadata-Version: 2.4
+Name: nse-eod-manager
+Version: 0.1.0
+Summary: NSE EOD Data Management Desktop Application
+Requires-Python: >=3.11
+Requires-Dist: nicegui>=2.10.0
+Requires-Dist: sqlalchemy>=2.0.36
+Requires-Dist: duckdb>=1.2.0
+Requires-Dist: duckdb-engine>=0.15.0
+Requires-Dist: alembic>=1.14.0
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: pandas-ta-classic>=0.6.20
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: openpyxl>=3.1.0
+Requires-Dist: httpx>=0.28.0
+Requires-Dist: yfinance>=0.2.40
+Requires-Dist: pydantic>=2.10.0
+Requires-Dist: pydantic-settings>=2.7.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: apscheduler>=3.10.0
+Requires-Dist: loguru>=0.7.0
+Requires-Dist: python-dateutil>=2.9.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24.0; extra == "dev"
+Requires-Dist: pytest-cov>=6.0.0; extra == "dev"
+Requires-Dist: ruff>=0.8.0; extra == "dev"
+Provides-Extra: cloud
+Requires-Dist: asyncpg>=0.30.0; extra == "cloud"
+Requires-Dist: psycopg2-binary>=2.9.0; extra == "cloud"

@@ -1,0 +1,368 @@
+import asyncio
+import os
+import httpx
+from datetime import date, timedelta, datetime
+from sqlalchemy import select, func
+from sqlalchemy.orm import Session
+from loguru import logger
+
+from src.models import Security, RawPrice, SyncLog
+from src.services.nse_client import NSEClient
+from src.services.stock_downloader import StockDownloader
+from src.services.etf_downloader import ETFDownloader
+from src.services.index_downloader import IndexDownloader
+from src.services.corporate_actions import CorporateActionsService
+from src.services.symbol_changes import SymbolChangesService
+from src.services.price_adjuster import adjust_all_prices, adjust_prices_for_security, adjust_incremental_prices
+from src.services.market_cap import calculate_all_historical_market_caps, calculate_historical_market_cap, calculate_incremental_market_caps_for_range
+from src.services.indicators import calculate_all_indicators, calculate_incremental_indicators_for_range
+from src.utils.backup_utils import create_db_backup, prune_old_backups
+
+
+
+class SyncManager:
+    """Orchestrates the full historical and daily incremental data synchronization workflow."""
+
+    def __init__(self, client: NSEClient):
+        self.client = client
+        self.stock_downloader = StockDownloader(client)
+        self.etf_downloader = ETFDownloader(client)
+        self.index_downloader = IndexDownloader(client)
+        self.ca_service = CorporateActionsService(client)
+        self.sc_service = SymbolChangesService(client)
+        self._cancel_requested = False
+
+    def request_cancel(self):
+        """Request cancellation of the current sync run."""
+        self._cancel_requested = True
+
+    async def run_sync(
+        self,
+        session: Session,
+        start_date: date,
+        end_date: date,
+        options: dict,
+        progress_callback=None
+    ) -> dict:
+        """
+        Execute sync workflow date-by-date and stage-by-stage.
+        
+        Args:
+            session: SQLAlchemy DB Session
+            start_date: Start date of price download
+            end_date: End date of price download
+            options: Dict of stages to run, e.g. {"stocks": True, "corporate_actions": True, ...}
+            progress_callback: Optional callable(stage: str, percentage: float, message: str)
+            
+        Returns:
+            Dict containing sync metrics and status.
+        """
+        self._cancel_requested = False
+        summary = {"status": "SUCCESS", "message": "", "records_processed": 0}
+        
+        # Determine total trading days in range
+        delta = end_date - start_date
+        total_days = delta.days + 1
+        trading_dates = [start_date + timedelta(days=i) for i in range(total_days)]
+        
+        # 1. PRE-DOWNLOAD ETF MASTER LIST (needed to filter ETFs from Bhavcopy)
+        if self._cancel_requested:
+            return self._cancel_summary()
+            
+        if options.get("etfs") or options.get("stocks"):
+            if progress_callback:
+                progress_callback("MASTER_DATA", 5.0, "Syncing ETF Master List...")
+            try:
+                await self.etf_downloader.sync_etf_master_list(session)
+            except Exception as e:
+                logger.error(f"Failed to sync ETF master list: {e}")
+
+        # Fetch active ETF set for bhavcopy partitioning
+        etf_symbols = await self.etf_downloader.get_all_etf_symbols(session)
+
+        # Log start of sync log
+        sync_type = "FULL_SYNC" if len(options) > 3 else "PARTIAL_SYNC"
+        existing_log = session.query(SyncLog).filter_by(
+            sync_type=sync_type,
+            sync_date=end_date
+        ).first()
+
+        if existing_log:
+            sync_log = existing_log
+            sync_log.status = "STARTED"
+            sync_log.started_at = datetime.now()
+            sync_log.completed_at = None
+            sync_log.error_message = None
+            sync_log.records_processed = 0
+        else:
+            sync_log = SyncLog(
+                sync_type=sync_type,
+                sync_date=end_date,
+                status="STARTED",
+                started_at=datetime.now()
+            )
+            session.add(sync_log)
+        session.commit()
+
+        total_prices_imported = 0
+        
+        # 2. DATE-BY-DATE INGESTION
+        for idx, current_date in enumerate(trading_dates):
+            if self._cancel_requested:
+                sync_log.status = "FAILED"
+                sync_log.error_message = "Cancel requested by user"
+                sync_log.completed_at = datetime.now()
+                session.commit()
+                return self._cancel_summary()
+                
+            percent = 10.0 + (idx / len(trading_dates)) * 40.0 # Map daily sync to 10% - 50% progress
+            
+            # Format display date
+            disp_date = current_date.strftime("%d-%b-%Y")
+            if progress_callback:
+                progress_callback("BHAVCOPY", percent, f"Syncing Daily Data for {disp_date}...")
+
+            # A. Download Daily Bhavcopy once
+            has_bhavcopy = False
+            bhavcopy_df = None
+            
+            if options.get("stocks") or options.get("etfs"):
+                date_str = current_date.strftime("%Y%m%d")
+                try:
+                    bhavcopy_df = await self.client.download_bhavcopy_csv(date_str)
+                    has_bhavcopy = True
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        logger.info(f"Bhavcopy 404 for {current_date.isoformat()} (Weekend/Holiday). Skipping.")
+                    else:
+                        logger.error(f"HTTP error downloading bhavcopy for {current_date.isoformat()}: {e}")
+                except Exception as e:
+                    logger.error(f"Error downloading bhavcopy for {current_date.isoformat()}: {e}")
+
+            # B. Ingest regular stocks from bhavcopy
+            if options.get("stocks") and has_bhavcopy:
+                try:
+                    filtered_stocks = self.stock_downloader.filter_stock_dataframe(bhavcopy_df, etf_symbols)
+                    imported = await self.stock_downloader.import_stock_prices(session, filtered_stocks, current_date)
+                    total_prices_imported += imported
+                except Exception as e:
+                    logger.error(f"Failed to import stocks on {current_date.isoformat()}: {e}")
+
+            # C. Ingest ETFs from bhavcopy
+            if options.get("etfs") and has_bhavcopy:
+                try:
+                    filtered_etfs = self.etf_downloader.filter_etf_dataframe(bhavcopy_df, etf_symbols)
+                    imported = await self.etf_downloader.import_etf_prices(session, filtered_etfs, current_date)
+                    total_prices_imported += imported
+                except Exception as e:
+                    logger.error(f"Failed to import ETFs on {current_date.isoformat()}: {e}")
+
+            # D. Ingest Indexes
+            if options.get("indexes"):
+                try:
+                    imported = await self.index_downloader.download_and_import_date(session, current_date)
+                    total_prices_imported += imported
+                except Exception as e:
+                    # Logs already written in service
+                    pass
+
+        # 3. MASTER DATA ENRICHMENT (Stocks)
+        if self._cancel_requested: return self._cancel_summary()
+        if options.get("stocks"):
+            if progress_callback:
+                progress_callback("MASTER_DATA", 55.0, "Enriching stock profiles from master list...")
+            try:
+                df_equity = await self.client.download_equity_list()
+                # Query existing stocks
+                stocks = session.query(Security).filter(Security.security_type == 'STOCK').all()
+                stock_map = {s.symbol: s for s in stocks}
+                isin_map = {s.isin: s for s in stocks if s.isin}
+                
+                enriched_count = 0
+                delisted_count = 0
+                
+                # Dynamically resolve ISIN column (NSE changed from 'ISIN NO' to 'ISIN NUMBER')
+                isin_col = "ISIN NUMBER" if "ISIN NUMBER" in df_equity.columns else "ISIN NO"
+                
+                # Match and update profiles
+                for _, row in df_equity.iterrows():
+                    sym = str(row["SYMBOL"]).strip()
+                    name = str(row["NAME OF COMPANY"]).strip()
+                    isin = str(row[isin_col]).strip()
+                    series = str(row["SERIES"]).strip()
+                    
+                    sec = isin_map.get(isin) or stock_map.get(sym)
+                    if sec:
+                        sec.company_name = name
+                        sec.isin = isin
+                        sec.data_source = "MASTER_LIST"
+                        sec.is_active = True
+                        sec.is_delisted = False
+                        enriched_count += 1
+                        
+                # Mark stocks NOT in EQUITY_L as delisted
+                master_isins = set(df_equity[isin_col].astype(str).str.strip())
+                for s in stocks:
+                    if s.isin and s.isin not in master_isins:
+                        s.is_active = False
+                        s.is_delisted = True
+                        delisted_count += 1
+                        
+                session.commit()
+                logger.info(f"Enriched {enriched_count} stocks. Marked {delisted_count} as delisted.")
+            except Exception as e:
+                logger.error(f"Failed stock master data enrichment: {e}")
+
+        # 4. SYMBOL CHANGES
+        if self._cancel_requested: return self._cancel_summary()
+        if options.get("stocks"):
+            if progress_callback:
+                progress_callback("SYMBOL_CHANGES", 60.0, "Syncing ticker rename logs from NSE...")
+            try:
+                await self.sc_service.sync_symbol_changes(session)
+            except Exception as e:
+                logger.error(f"Failed to sync symbol changes: {e}")
+
+        # 5. FETCH SHARES OUTSTANDING (stocks only)
+        if self._cancel_requested: return self._cancel_summary()
+        if options.get("market_cap"):
+            if progress_callback:
+                progress_callback("SHARES_OUTSTANDING", 65.0, "Fetching outstanding shares from quote API (new/missing only)...")
+            
+            # Find active stocks that have NULL issued_shares
+            missing_shares_stocks = session.query(Security).filter(
+                Security.security_type == 'STOCK',
+                Security.is_active == True,
+                Security.is_delisted == False,
+                Security.issued_shares == None
+            ).all()
+            
+            if missing_shares_stocks:
+                logger.info(f"Fetching issued shares count for {len(missing_shares_stocks)} stocks...")
+                consecutive_failures = 0
+                for idx, stock in enumerate(missing_shares_stocks):
+                    if self._cancel_requested: return self._cancel_summary()
+                    
+                    # Update progress slightly
+                    sub_pct = 65.0 + (idx / len(missing_shares_stocks)) * 10.0
+                    if progress_callback:
+                        progress_callback("SHARES_OUTSTANDING", sub_pct, f"Fetching shares for {stock.symbol} ({idx+1}/{len(missing_shares_stocks)})...")
+                    
+                    try:
+                        quote = await self.client.fetch_stock_quote(stock.symbol, retries=0)
+                        # Extract issuedSize from quote (structure: quote['marketDeptOrderBook']['tradeInfo']['issuedCap'] or similar)
+                        # Safe extract:
+                        trade_info = quote.get("marketDeptOrderBook", {}).get("tradeInfo", {})
+                        issued_cap = trade_info.get("issuedSize") or quote.get("securityInfo", {}).get("issuedSize")
+                        
+                        if issued_cap:
+                            stock.issued_shares = int(float(issued_cap))
+                            session.commit()
+                            logger.info(f"Updated shares outstanding for {stock.symbol}: {stock.issued_shares}")
+                        consecutive_failures = 0  # Reset counter on success
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch quote for {stock.symbol}: {e}")
+                        consecutive_failures += 1
+                        
+                        if consecutive_failures >= 5:
+                            logger.error("Too many consecutive quote fetch failures (likely rate-limited/blocked by NSE). Aborting shares outstanding fetch stage.")
+                            break
+                        # Keep going to prevent locking
+                        await asyncio.sleep(1.0)
+
+        # 6. SYNC CORPORATE ACTIONS
+        if self._cancel_requested: return self._cancel_summary()
+        if options.get("corporate_actions"):
+            if progress_callback:
+                progress_callback("CORPORATE_ACTIONS", 75.0, "Fetching corporate splits and bonuses...")
+            try:
+                # Sync actions from start_date to end_date
+                await self.ca_service.sync_corporate_actions(session, start_date, end_date)
+            except Exception as e:
+                logger.error(f"Failed to sync corporate actions: {e}")
+
+        # Determine if database already has price history and if the date range is small
+        has_history = session.query(RawPrice).first() is not None
+        is_incremental = has_history and (end_date - start_date).days <= 10
+        logger.info(f"Sync type detection: has_history={has_history}, range_days={(end_date - start_date).days}, is_incremental={is_incremental}")
+
+        # 7. PRICE ADJUSTMENT
+        if self._cancel_requested: return self._cancel_summary()
+        if options.get("corporate_actions"):
+            if progress_callback:
+                progress_callback("PRICE_ADJUSTMENT", 80.0, "Running price adjustment calculations...")
+            try:
+                if is_incremental:
+                    logger.info("Running optimized incremental price adjustment...")
+                    await adjust_incremental_prices(session, start_date, end_date)
+                else:
+                    logger.info("Running global price adjustment...")
+                    await adjust_all_prices(session)
+            except Exception as e:
+                logger.error(f"Failed price adjustments: {e}")
+
+        # 8. HISTORICAL MARKET CAP
+        if self._cancel_requested: return self._cancel_summary()
+        if options.get("market_cap"):
+            if progress_callback:
+                progress_callback("MARKET_CAP", 85.0, "Calculating historical market caps...")
+            try:
+                if is_incremental:
+                    logger.info("Running optimized incremental market cap calculations...")
+                    await calculate_incremental_market_caps_for_range(session, start_date, end_date)
+                else:
+                    logger.info("Running global historical market cap calculations...")
+                    await calculate_all_historical_market_caps(session)
+            except Exception as e:
+                logger.error(f"Failed historical market cap calculations: {e}")
+
+        # 9. TECHNICAL INDICATORS
+        if self._cancel_requested: return self._cancel_summary()
+        if options.get("indicators"):
+            if progress_callback:
+                progress_callback("INDICATORS", 90.0, "Calculating SMA technical indicators...")
+            try:
+                if is_incremental:
+                    logger.info("Running optimized incremental SMA indicator calculations...")
+                    await calculate_incremental_indicators_for_range(session, start_date, end_date)
+                else:
+                    logger.info("Running global SMA indicator calculations...")
+                    await calculate_all_indicators(session)
+            except Exception as e:
+                logger.error(f"Failed technical indicator calculations: {e}")
+
+        # Finalize
+        if progress_callback:
+            progress_callback("FINAL", 100.0, "Sync successfully completed!")
+            
+        sync_log.status = "SUCCESS"
+        sync_log.records_processed = total_prices_imported
+        sync_log.completed_at = datetime.now()
+        session.commit()
+
+        # Close session and dispose engine to release Windows file locks before backup
+        session.close()
+        from src.db.engine import engine as _engine
+        _engine.dispose()
+
+        # Create database backup after successful sync
+        try:
+            logger.info("Sync completed successfully. Triggering automated database backup...")
+            backup_path = create_db_backup()
+            if backup_path:
+                prune_old_backups(keep_count=5)
+        except Exception as backup_err:
+            logger.warning(f"Failed to create automated backup after sync: {backup_err}")
+
+        summary["records_processed"] = total_prices_imported
+        summary["message"] = f"Ingested {total_prices_imported} price records successfully."
+        return summary
+
+
+    def _cancel_summary(self) -> dict:
+        logger.warning("Data sync cancelled by user request.")
+        return {
+            "status": "CANCELLED",
+            "message": "The synchronization job was cancelled by user.",
+            "records_processed": 0
+        }

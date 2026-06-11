@@ -1,0 +1,56 @@
+[project]
+name = "nse-eod-manager"
+version = "0.1.0"
+description = "NSE EOD Data Management Desktop Application"
+requires-python = ">=3.11"
+
+dependencies = [
+    # --- UI Framework ---
+    "nicegui>=2.10.0",
+
+    # --- Database ---
+    "sqlalchemy>=2.0.36",
+    "duckdb>=1.2.0",
+    "duckdb-engine>=0.15.0",
+    "alembic>=1.14.0",
+
+    # --- Data Processing ---
+    "pandas>=2.2.0",
+    "pandas-ta-classic>=0.6.20",
+    "numpy>=1.26.0",
+    "openpyxl>=3.1.0",
+
+    # --- HTTP & Networking ---
+    "httpx>=0.28.0",
+
+    # --- External Data Sources ---
+    "yfinance>=0.2.40",
+
+    # --- Configuration & Validation ---
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-dotenv>=1.0.0",
+
+    # --- Scheduling & Logging ---
+    "apscheduler>=3.10.0",
+    "loguru>=0.7.0",
+
+    # --- Utilities ---
+    "python-dateutil>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+]
+
+cloud = [
+    "asyncpg>=0.30.0",
+    "psycopg2-binary>=2.9.0",
+]
+
+[project.scripts]
+nse-eod = "src.main:main"
