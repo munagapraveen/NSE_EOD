@@ -5,67 +5,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from loguru import logger
 
-from src.models import Security, RawPrice
+from src.models import Security
 from src.db.repository import bulk_upsert_raw_prices
 from src.services.nse_client import NSEClient
 from config.constants import EQUITY_SERIES
+from src.utils.math_utils import safe_float, safe_int
 
 
-async def find_or_create_stock(
-    session: Session, symbol: str, series: str, isin: str, trade_date: date
-) -> int:
-    """
-    Find existing security by ISIN (preferred) or symbol.
-    Lookups are performed GLOBALLY (ignoring security_type) to respect the unique constraints.
-    Returns the security ID.
-    """
-    # Step 1: Try ISIN lookup (most reliable since ISIN never changes)
-    if isin:
-        sec = session.execute(
-            select(Security).where(Security.isin == isin)
-        ).scalar_one_or_none()
-        
-        if sec:
-            # Update last_seen_date and symbol if changed (symbol change detected)
-            if sec.last_seen_date is None or trade_date > sec.last_seen_date:
-                sec.last_seen_date = trade_date
-            if sec.symbol != symbol:
-                logger.info(
-                    f"Symbol change detected via bhavcopy: {sec.symbol} → {symbol} (ISIN: {isin})"
-                )
-                sec.symbol = symbol
-            # Ensure type is upgraded or maintained (Stocks discovered from bhavcopy default to STOCK)
-            return sec.id
-
-    # Step 2: Try symbol lookup
-    sec = session.execute(
-        select(Security).where(Security.symbol == symbol)
-    ).scalar_one_or_none()
-    
-    if sec:
-        if sec.last_seen_date is None or trade_date > sec.last_seen_date:
-            sec.last_seen_date = trade_date
-        if isin and sec.isin is None:
-            sec.isin = isin  # Backfill ISIN if missing
-        return sec.id
-
-    # Step 3: Auto-create new stock record (Bhavcopy-First Discovery)
-    new_sec = Security(
-        symbol=symbol,
-        company_name=None,  # Enriched later from master list
-        security_type="STOCK",
-        isin=isin if isin else None,
-        face_value=None,
-        is_active=True,
-        is_delisted=False,
-        data_source="BHAVCOPY_DISCOVERED",
-        first_seen_date=trade_date,
-        last_seen_date=trade_date,
-    )
-    session.add(new_sec)
-    session.flush()  # Flush to get the auto-generated database ID
-    logger.info(f"Auto-discovered stock: {symbol} (ISIN: {isin})")
-    return new_sec.id
 
 
 class StockDownloader:
@@ -119,18 +65,62 @@ class StockDownloader:
 
         records_to_insert = []
         
-        # Find or create security ids for each unique stock in the bhavcopy
+        # Bulk query matching securities by symbol or ISIN to avoid N+1 query overhead
         unique_stocks = filtered_df[[symbol_col, series_col, isin_col]].drop_duplicates()
-        
+        symbols = list({str(row[symbol_col]).strip() for _, row in unique_stocks.iterrows() if row[symbol_col]})
+        isins = list({str(row[isin_col]).strip() for _, row in unique_stocks.iterrows() if row[isin_col]})
+
+        db_securities = session.execute(
+            select(Security)
+            .where((Security.symbol.in_(symbols)) | (Security.isin.in_(isins)))
+        ).scalars().all()
+
+        sec_by_isin = {s.isin: s for s in db_securities if s.isin}
+        sec_by_symbol = {s.symbol: s for s in db_securities}
+
         stock_id_map = {}
         for _, row in unique_stocks.iterrows():
             sym = str(row[symbol_col]).strip()
             srs = str(row[series_col]).strip()
             isin_val = str(row[isin_col]).strip()
-            
-            # Find/create security record
-            stock_id = await find_or_create_stock(session, sym, srs, isin_val, trade_date)
-            stock_id_map[(sym, isin_val)] = stock_id
+
+            sec = sec_by_isin.get(isin_val) if isin_val else None
+            if not sec:
+                sec = sec_by_symbol.get(sym)
+
+            if sec:
+                # Update last_seen_date and detect symbol changes
+                if sec.last_seen_date is None or trade_date > sec.last_seen_date:
+                    sec.last_seen_date = trade_date
+                if sec.isin == isin_val and sec.symbol != sym and (sec.last_seen_date is None or trade_date >= sec.last_seen_date):
+                    logger.info(f"Symbol change detected via bhavcopy: {sec.symbol} → {sym} (ISIN: {isin_val})")
+                    sec.symbol = sym
+                if isin_val and sec.isin is None:
+                    sec.isin = isin_val
+                stock_id_map[(sym, isin_val)] = sec.id
+            else:
+                # Auto-create new stock record
+                new_sec = Security(
+                    symbol=sym,
+                    company_name=None,
+                    security_type="STOCK",
+                    isin=isin_val if isin_val else None,
+                    face_value=None,
+                    is_active=True,
+                    is_delisted=False,
+                    data_source="BHAVCOPY_DISCOVERED",
+                    first_seen_date=trade_date,
+                    last_seen_date=trade_date,
+                )
+                session.add(new_sec)
+                session.flush()  # get ID
+                logger.info(f"Auto-discovered stock: {sym} (ISIN: {isin_val})")
+
+                # Cache locally for subsequent lookups in the same batch
+                sec_by_symbol[sym] = new_sec
+                if isin_val:
+                    sec_by_isin[isin_val] = new_sec
+                stock_id_map[(sym, isin_val)] = new_sec.id
 
         # Parse prices and map to security_id
         for _, row in filtered_df.iterrows():
@@ -140,20 +130,6 @@ class StockDownloader:
             
             if not stock_id:
                 continue
-
-            def safe_float(val, default=0.0):
-                try:
-                    f = float(val)
-                    return 0.0 if math.isnan(f) else f
-                except:
-                    return default
-
-            def safe_int(val, default=0):
-                try:
-                    i = int(val)
-                    return default if math.isnan(i) else i
-                except:
-                    return default
 
             record = {
                 "security_id": stock_id,
@@ -186,8 +162,8 @@ class StockDownloader:
         try:
             df = await self.client.download_bhavcopy_csv(date_str)
         except Exception as e:
-            import httpx
-            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+            from src.services.nse_client import HttpNotFoundError
+            if isinstance(e, HttpNotFoundError):
                 logger.info(f"No bhavcopy found for {trade_date.isoformat()} (likely weekend or holiday)")
                 return 0
             logger.error(f"Failed to download bhavcopy for {trade_date.isoformat()}: {e}")

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from loguru import logger
 
 from src.models import Security, AdjustedPrice, Indicator
+from src.utils.math_utils import truncate_decimal
 
 
 async def calculate_indicators_for_security(session: Session, security_id: int) -> int:
@@ -54,7 +55,7 @@ async def calculate_indicators_for_security(session: Session, security_id: int) 
         # Round and map values
         for col in ["sma_5", "sma_10", "sma_20", "sma_50", "sma_200"]:
             val = row[col]
-            record[col] = round(float(val), 2) if pd.notna(val) else None
+            record[col] = truncate_decimal(val, 2) if pd.notna(val) else None
             
         records.append(record)
 
@@ -146,7 +147,7 @@ async def calculate_incremental_indicators_for_range(session: Session, start_dat
     # Load all adjusted prices in the range in a single query, excluding affected securities
     query = (
         select(AdjustedPrice.security_id, AdjustedPrice.trade_date, AdjustedPrice.adj_close)
-        .where(AdjustedPrice.trade_date >= start_date - timedelta(days=365))
+        .where(AdjustedPrice.trade_date >= start_date - timedelta(days=450))
         .where(AdjustedPrice.trade_date <= end_date)
     )
     if affected_sec_ids:
@@ -189,7 +190,7 @@ async def calculate_incremental_indicators_for_range(session: Session, start_dat
         }
         for col in ["sma_5", "sma_10", "sma_20", "sma_50", "sma_200"]:
             val = row[col]
-            record[col] = round(float(val), 2) if pd.notna(val) else None
+            record[col] = truncate_decimal(val, 2) if pd.notna(val) else None
         records_to_insert.append(record)
 
     if records_to_insert:

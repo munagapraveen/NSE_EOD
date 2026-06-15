@@ -34,6 +34,7 @@ class Security(Base):
     corporate_actions = relationship("CorporateAction", back_populates="security", primaryjoin="Security.id == CorporateAction.security_id", foreign_keys="CorporateAction.security_id", cascade="all, delete-orphan")
     market_caps = relationship("MarketCap", back_populates="security", primaryjoin="Security.id == MarketCap.security_id", foreign_keys="MarketCap.security_id", cascade="all, delete-orphan")
     symbol_changes = relationship("SymbolChange", back_populates="security", primaryjoin="Security.id == SymbolChange.security_id", foreign_keys="SymbolChange.security_id", cascade="all, delete-orphan")
+    historical_shares = relationship("HistoricalShare", back_populates="security", primaryjoin="Security.id == HistoricalShare.security_id", foreign_keys="HistoricalShare.security_id", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Security(symbol={self.symbol}, type={self.security_type}, active={self.is_active})>"
@@ -46,7 +47,7 @@ class RawPrice(Base):
     )
 
     id = Column(Integer, Sequence("raw_prices_id_seq"), primary_key=True)
-    security_id = Column(Integer, nullable=False, index=True)
+    security_id = Column(Integer, ForeignKey("securities.id"), nullable=False, index=True)
     trade_date = Column(Date, nullable=False, index=True)
     open = Column(Numeric(12, 2), nullable=False)
     high = Column(Numeric(12, 2), nullable=False)
@@ -72,12 +73,12 @@ class AdjustedPrice(Base):
     )
 
     id = Column(Integer, Sequence("adjusted_prices_id_seq"), primary_key=True)
-    security_id = Column(Integer, nullable=False, index=True)
+    security_id = Column(Integer, ForeignKey("securities.id"), nullable=False, index=True)
     trade_date = Column(Date, nullable=False, index=True)
-    adj_open = Column(Numeric(12, 4), nullable=False)
-    adj_high = Column(Numeric(12, 4), nullable=False)
-    adj_low = Column(Numeric(12, 4), nullable=False)
-    adj_close = Column(Numeric(12, 4), nullable=False)
+    adj_open = Column(Numeric(12, 2), nullable=False)
+    adj_high = Column(Numeric(12, 2), nullable=False)
+    adj_low = Column(Numeric(12, 2), nullable=False)
+    adj_close = Column(Numeric(12, 2), nullable=False)
     adj_volume = Column(BigInteger, nullable=False)
     adjustment_factor = Column(Numeric(12, 6), nullable=False, default=1.0)
 

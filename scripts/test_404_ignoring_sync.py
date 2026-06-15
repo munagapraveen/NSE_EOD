@@ -3,14 +3,14 @@ Test: Calendar date checking and 404-ignoring behavior in SyncManager
 """
 import sys
 import os
-import httpx
+import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import asyncio
-from datetime import date, timedelta, datetime
+from datetime import date, datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.models import Base, Security, RawPrice, SyncLog
 from src.services.sync_manager import SyncManager
@@ -25,6 +25,10 @@ session = Session()
 client_mock = MagicMock()
 client_mock.download_bhavcopy_csv = AsyncMock()
 client_mock.download_index_csv = AsyncMock()
+client_mock.download_etf_list = AsyncMock(return_value=pd.DataFrame(columns=["SYMBOL"]))
+client_mock.download_symbol_changes = AsyncMock(return_value=pd.DataFrame(columns=["company_name", "old_symbol", "new_symbol", "effective_date"]))
+client_mock.download_equity_list = AsyncMock(return_value=pd.DataFrame(columns=["SYMBOL", "NAME OF COMPANY", "ISIN NUMBER", "SERIES"]))
+client_mock.fetch_corporate_actions = AsyncMock(return_value=[])
 
 # Setup SyncManager
 sm = SyncManager(client_mock)
@@ -33,6 +37,7 @@ async def test_all():
     # Helper to clean and initialize basic securities
     def reset_db_state():
         session.query(RawPrice).delete()
+        session.commit()
         session.query(Security).delete()
         session.commit()
         
@@ -53,8 +58,8 @@ async def test_all():
     
     # Saturday Jan 4, 2025 (Weekend)
     # Since we ignore 404s, mock a 404 response
-    res = httpx.Response(status_code=404, request=httpx.Request("GET", "http://test"))
-    err = httpx.HTTPStatusError("404 Not Found", request=res.request, response=res)
+    from src.services.nse_client import HttpNotFoundError
+    err = HttpNotFoundError("http://test")
     client_mock.download_bhavcopy_csv.side_effect = err
     client_mock.download_index_csv.side_effect = err
     

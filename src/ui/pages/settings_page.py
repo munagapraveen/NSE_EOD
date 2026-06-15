@@ -4,7 +4,7 @@ from nicegui import ui
 
 from config.settings import settings
 from loguru import logger
-from src.models import Base, Security, RawPrice, AdjustedPrice, MarketCap, Indicator, CorporateAction, SymbolChange, SyncLog
+from src.models import Base
 from src.db.engine import engine
 import glob
 from src.utils.backup_utils import create_db_backup, prune_old_backups, restore_db_from_backup, get_db_file_path
@@ -12,21 +12,41 @@ from src.utils.backup_utils import create_db_backup, prune_old_backups, restore_
 
 
 def save_env_settings(db_url: str, start_date_str: str, delay: float, native: bool, dark: bool):
-    """Overwrite the .env file with updated settings values."""
+    """Overwrite the .env file with updated settings values, preserving other variables."""
     env_path = ".env"
     
+    # Read existing variables from .env to preserve them
+    existing_vars = {}
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        existing_vars[k.strip()] = v.strip()
+        except Exception as e:
+            logger.warning(f"Could not read existing .env file: {e}")
+
+    # Update modified settings
+    existing_vars["DATABASE_URL"] = db_url
+    existing_vars["NSE_START_DATE"] = start_date_str
+    existing_vars["NSE_REQUEST_DELAY_SECONDS"] = str(delay)
+    existing_vars["APP_NATIVE"] = str(native).upper()
+    existing_vars["APP_DARK_MODE"] = str(dark).upper()
+    
+    # Ensure mandatory baseline settings are present
+    if "APP_TITLE" not in existing_vars:
+        existing_vars["APP_TITLE"] = settings.app_title
+    if "APP_HOST" not in existing_vars:
+        existing_vars["APP_HOST"] = settings.app_host
+    if "APP_PORT" not in existing_vars:
+        existing_vars["APP_PORT"] = str(settings.app_port)
+    if "LOG_LEVEL" not in existing_vars:
+        existing_vars["LOG_LEVEL"] = settings.log_level
+
     # Compile new env content
-    lines = [
-        f"DATABASE_URL={db_url}\n",
-        f"NSE_START_DATE={start_date_str}\n",
-        f"NSE_REQUEST_DELAY_SECONDS={delay}\n",
-        f"APP_TITLE={settings.app_title}\n",
-        f"APP_HOST={settings.app_host}\n",
-        f"APP_PORT={settings.app_port}\n",
-        f"APP_NATIVE={str(native).upper()}\n",
-        f"APP_DARK_MODE={str(dark).upper()}\n",
-        f"LOG_LEVEL={settings.log_level}\n",
-    ]
+    lines = [f"{k}={v}\n" for k, v in existing_vars.items()]
     
     try:
         with open(env_path, "w", encoding="utf-8") as f:
@@ -171,7 +191,16 @@ def render():
                     ui.button("Cancel", on_click=rebuild_dialog.close).props("flat color=grey").classes("text-white")
                     ui.button("Confirm Rebuild", on_click=lambda: execute_rebuild()).props("unelevated color=green").classes("text-white")
 
+            def is_sync_running():
+                from src.ui.pages import download
+                if download._sync_manager and download._sync_manager.is_running:
+                    ui.notify("Cannot perform database administration tasks while a download is running.", type="warning")
+                    return True
+                return False
+
             async def handle_backup():
+                if is_sync_running():
+                    return
                 path = create_db_backup()
                 if path:
                     prune_old_backups(keep_count=5)
@@ -185,6 +214,8 @@ def render():
 
             def execute_restore():
                 restore_dialog.close()
+                if is_sync_running():
+                    return
                 filename = backup_select.value
                 if not filename:
                     ui.notify("No backup selected for restore.", type="negative")
@@ -209,6 +240,8 @@ def render():
 
             def execute_rebuild():
                 rebuild_dialog.close()
+                if is_sync_running():
+                    return
                 ui.notify("Starting database index rebuild. Please wait...", type="info")
                 
                 # Dispose of SQLAlchemy connections to unlock the file
@@ -246,7 +279,11 @@ def render():
 
         def execute_wipe():
             confirm_dialog.close()
+            if is_sync_running():
+                return
             from sqlalchemy import text
+            from src.db.engine import SessionLocal
+            session = SessionLocal()
             try:
                 tables_to_clear = [
                     "sync_log",
@@ -256,35 +293,38 @@ def render():
                     "raw_prices",
                     "corporate_actions",
                     "symbol_changes",
+                    "historical_shares",
                     "securities"
                 ]
                 # Delete rows in committed transaction in dependency order (children first)
-                with engine.begin() as conn:
-                    for table in tables_to_clear:
-                        success = False
-                        # Try all possible catalog/schema prefixes (handles any DuckDB attachment quirks)
-                        for prefix in ["market.main.", "main.main.", "market.", "main.", ""]:
-                            try:
-                                conn.execute(text(f"DELETE FROM {prefix}{table};"))
+                for table in tables_to_clear:
+                    success = False
+                    # Try all possible catalog/schema prefixes (handles any DuckDB attachment quirks)
+                    for prefix in ["market.main.", "main.main.", "market.", "main.", ""]:
+                        try:
+                            session.execute(text(f"DELETE FROM {prefix}{table};"))
+                            success = True
+                            break
+                        except Exception as ex:
+                            err_str = str(ex).lower()
+                            # If the table doesn't exist, we consider it successfully cleared/empty
+                            if "does not exist" in err_str or "not found" in err_str:
                                 success = True
                                 break
-                            except Exception as ex:
-                                err_str = str(ex).lower()
-                                # If the table doesn't exist, we consider it successfully cleared/empty
-                                if "does not exist" in err_str or "not found" in err_str:
-                                    success = True
-                                    break
-                                logger.warning(f"Prefix '{prefix}' failed for '{table}': {ex}")
-                                continue
-                        if not success:
-                            raise Exception(f"Could not resolve table '{table}' in any catalog namespace.")
-                
+                            logger.warning(f"Prefix '{prefix}' failed for '{table}': {ex}")
+                            continue
+                    if not success:
+                        raise Exception(f"Could not resolve table '{table}' in any catalog namespace.")
+                session.commit()
                 # Re-run schema creation to ensure all tables exist
                 Base.metadata.create_all(bind=engine)
                 ui.notify("Database wiped successfully!", type="positive")
             except Exception as e:
+                session.rollback()
                 logger.error(f"Failed to wipe database: {e}")
                 ui.notify(f"Database wipe failed: {e}", type="negative")
+            finally:
+                session.close()
         
         wipe_btn.on("click", confirm_dialog.open)
 

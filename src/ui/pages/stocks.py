@@ -43,7 +43,7 @@ def get_stocks_list():
                 "market_cap": mcap_cr
             })
         return data
-    except Exception as e:
+    except Exception:
         return []
     finally:
         session.close()

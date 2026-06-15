@@ -1,5 +1,6 @@
 from sqlalchemy import select
 from nicegui import ui
+from loguru import logger
 
 from src.db.engine import SessionLocal
 from src.models import Security, CorporateAction
@@ -36,7 +37,15 @@ def get_corporate_actions():
             
             # Formulate detail string
             if r.action_type == "SPLIT":
-                detail = f"Split {int(r.old_face_value)} → {int(r.new_face_value)} (Factor: {float(r.adjustment_factor):.1f})"
+                old_fv = "-"
+                new_fv = "-"
+                if r.old_face_value is not None:
+                    fv_float = float(r.old_face_value)
+                    old_fv = int(fv_float) if fv_float.is_integer() else fv_float
+                if r.new_face_value is not None:
+                    fv_float = float(r.new_face_value)
+                    new_fv = int(fv_float) if fv_float.is_integer() else fv_float
+                detail = f"Split {old_fv} → {new_fv} (Factor: {float(r.adjustment_factor):.1f})"
             else:
                 detail = f"Bonus {r.bonus_ratio_new}:{r.bonus_ratio_existing} (Factor: {float(r.adjustment_factor):.1f})"
                 
@@ -51,6 +60,7 @@ def get_corporate_actions():
             })
         return data
     except Exception as e:
+        logger.exception(f"Failed to fetch corporate actions: {e}")
         return []
     finally:
         session.close()

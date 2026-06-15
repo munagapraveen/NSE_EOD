@@ -11,7 +11,7 @@ class SymbolChange(Base):
     )
 
     id = Column(Integer, Sequence("symbol_changes_id_seq"), primary_key=True)
-    security_id = Column(Integer, nullable=True, index=True)
+    security_id = Column(Integer, ForeignKey("securities.id"), nullable=True, index=True)
     old_symbol = Column(String(30), nullable=False, index=True)
     new_symbol = Column(String(30), nullable=False, index=True)
     effective_date = Column(Date, nullable=True)

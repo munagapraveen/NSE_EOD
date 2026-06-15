@@ -50,9 +50,27 @@ def check_db_integrity() -> tuple[bool, str]:
         
     session = SessionLocal()
     try:
-        # Perform test queries that trigger index lookups/scans
+        # 1. Perform basic table access checks
         session.query(func.count(Security.id)).scalar()
         session.query(SyncLog).first()
+        
+        # 2. Deep index scan: Fetch last 10 rows sequentially (ordered by ID desc)
+        # to bypass indexes, then check if we can retrieve them using unique indexes.
+        recent_secs = session.query(Security.symbol, Security.isin).order_by(Security.id.desc()).limit(10).all()
+        for symbol, isin in recent_secs:
+            if symbol:
+                exists_sym = session.query(Security.symbol).filter(Security.symbol == symbol).first()
+                if not exists_sym:
+                    err = f"Index mismatch: Symbol '{symbol}' exists in table but cannot be queried via index."
+                    logger.error(err)
+                    return True, err
+            if isin:
+                exists_isin = session.query(Security.isin).filter(Security.isin == isin).first()
+                if not exists_isin:
+                    err = f"Index mismatch: ISIN '{isin}' exists in table but cannot be queried via index."
+                    logger.error(err)
+                    return True, err
+                    
         return False, ""
     except Exception as e:
         logger.error(f"Database integrity check failed: {e}")

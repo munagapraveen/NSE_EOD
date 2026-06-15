@@ -5,7 +5,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.base import Base
-from src.db.engine import engine, SessionLocal
+from src.db.engine import engine
 from sqlalchemy import inspect
 
 

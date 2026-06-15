@@ -1,5 +1,7 @@
 """All NSE URLs, series types, headers, and indicator configurations."""
 
+from datetime import date
+
 # ============================================================
 # NSE ARCHIVE URLs (Low protection — User-Agent header only)
 # ============================================================
@@ -33,10 +35,6 @@ SYMBOL_CHANGE_URL = (
     "https://nsearchives.nseindia.com/content/equities/symbolchange.csv"
 )
 
-# Name changes history
-NAME_CHANGE_URL = (
-    "https://nsearchives.nseindia.com/content/equities/namechange.csv"
-)
 
 # ============================================================
 # NSE API URLs (High protection — requires session cookies)
@@ -90,9 +88,38 @@ UDIFF_COLUMNS = {
 }
 
 # ============================================================
-# Index List to Track
+# HTTP Headers (required by NSE)
 # ============================================================
 
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
+}
+
+# Accept header override for JSON API calls (quote-equity, corporate actions, etc.)
+# NSE's API endpoints reject requests that don't advertise JSON acceptance.
+NSE_API_ACCEPT = "application/json, text/plain, */*"
+
+# ============================================================
+# BSE Shareholding Pattern Quarter Anchor Configuration
+# ============================================================
+BSE_ANCHOR_DATE = date(2026, 3, 31)
+BSE_ANCHOR_QTRID = 129
+
+# ============================================================
+# Tracked Indexes configuration (whitelist)
+# ============================================================
 TRACKED_INDEXES = [
     "NIFTY 50",
     "NIFTY NEXT 50",
@@ -123,38 +150,3 @@ TRACKED_INDEXES = [
     "NIFTY PRIVATE BANK",
 ]
 
-# ============================================================
-# HTTP Headers (required by NSE)
-# ============================================================
-
-NSE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
-    "Referer": "https://www.nseindia.com/",
-    "Connection": "keep-alive",
-}
-
-# ============================================================
-# Technical Indicators Configuration
-# ============================================================
-
-INDICATOR_CONFIG = {
-    "sma": [20, 50, 200],
-    "ema": [12, 26],
-    "rsi": [14],
-    "macd": {"fast": 12, "slow": 26, "signal": 9},
-    "bollinger": {"length": 20, "std": 2},
-    "atr": [14],
-    "obv": True,
-    "vwap": True,
-    "stochastic": {"k": 14, "d": 3, "smooth_k": 3},
-}

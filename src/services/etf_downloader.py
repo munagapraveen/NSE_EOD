@@ -5,9 +5,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from loguru import logger
 
-from src.models import Security, RawPrice
+from src.models import Security
 from src.db.repository import bulk_upsert_raw_prices
 from src.services.nse_client import NSEClient
+from src.utils.math_utils import safe_float, safe_int
 
 
 class ETFDownloader:
@@ -83,7 +84,8 @@ class ETFDownloader:
                 sec.symbol = sym
                 sec.company_name = name
                 sec.security_type = "ETF"
-                sec.isin = isin_val
+                if isin_val:
+                    sec.isin = isin_val
                 sec.is_active = True
                 # we don't have underlying_index column in securities directly, but we can store it in industry/remarks
                 sec.industry = underlying
@@ -192,21 +194,6 @@ class ETFDownloader:
                     etf_id_map[sym] = etf_id
                     logger.info(f"Discovered new ETF in bhavcopy: {sym} (ISIN: {isin_val})")
 
-            # Safe float parsing
-            def safe_float(val, default=0.0):
-                try:
-                    f = float(val)
-                    return 0.0 if math.isnan(f) else f
-                except:
-                    return default
-
-            # Safe int parsing
-            def safe_int(val, default=0):
-                try:
-                    i = int(val)
-                    return default if math.isnan(i) else i
-                except:
-                    return default
 
             record = {
                 "security_id": etf_id,
@@ -237,8 +224,8 @@ class ETFDownloader:
         try:
             df = await self.client.download_bhavcopy_csv(date_str)
         except Exception as e:
-            import httpx
-            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+            from src.services.nse_client import HttpNotFoundError
+            if isinstance(e, HttpNotFoundError):
                 return 0
             logger.error(f"Failed to fetch bhavcopy for ETF parsing on {trade_date.isoformat()}: {e}")
             raise e

@@ -12,6 +12,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from src.models import Security, RawPrice, AdjustedPrice, MarketCap
+from src.utils.math_utils import truncate_decimal
 
 
 def get_closest_trading_date(session: Session, target_date: date) -> date:
@@ -68,7 +69,7 @@ def run_sharpe_screener(
     logger.info(f"Running Sharpe Screener relative to trading date: {t_date}")
     
     # Step 1: Filter active stocks with Market Cap >= mcap_filter_cr
-    mcap_threshold_bps = mcap_filter_cr * 10_000_000.0  # Convert Cr to absolute Rupees
+    mcap_threshold_cr = mcap_filter_cr  # Database stores market cap in Crores directly
     
     mcap_query = (
         select(
@@ -84,7 +85,7 @@ def run_sharpe_screener(
         .where(Security.is_active == True)
         .where(Security.is_delisted == False)
         .where(MarketCap.trade_date == t_date)
-        .where(MarketCap.market_cap >= mcap_threshold_bps)
+        .where(MarketCap.market_cap >= mcap_threshold_cr)
     )
     
     mcap_rows = session.execute(mcap_query).all()
@@ -98,7 +99,7 @@ def run_sharpe_screener(
             "company_name": r.company_name or "-",
             "isin": r.isin or "-",
             "industry": r.industry or "-",
-            "market_cap_cr": round(float(r.market_cap) / 10_000_000.0, 2)
+            "market_cap_cr": truncate_decimal(r.market_cap, 2)
         }
         for r in mcap_rows
     }
@@ -267,7 +268,7 @@ def run_sharpe_screener(
         last_63 = grp.iloc[-63:]
         circuit_hits = 0
         bands = [5.0, 10.0, 20.0]
-        tol = 0.025  # 0.025% tolerance
+        tol = 0.15  # 0.15% tolerance to accommodate tick-size rounding (5 paise)
         
         for _, r_row in last_63.iterrows():
             prev_c = r_row["raw_prev_close"]

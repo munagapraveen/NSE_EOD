@@ -3,11 +3,10 @@ Test: Incomplete sync detection and exception propagation in SyncManager
 """
 import sys
 import os
-import httpx
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import asyncio
-from datetime import date, timedelta, datetime
+from datetime import date, datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,18 +22,26 @@ Session = sessionmaker(bind=engine)
 session = Session()
 
 # Setup client mock
+import pandas as pd
 client_mock = MagicMock()
 client_mock.download_bhavcopy_csv = AsyncMock()
 client_mock.download_index_csv = AsyncMock()
+client_mock.download_etf_list = AsyncMock(return_value=pd.DataFrame(columns=["SYMBOL"]))
+client_mock.download_symbol_changes = AsyncMock(return_value=pd.DataFrame(columns=["company_name", "old_symbol", "new_symbol", "effective_date"]))
+client_mock.download_equity_list = AsyncMock(return_value=pd.DataFrame(columns=["SYMBOL", "NAME OF COMPANY", "ISIN NUMBER", "SERIES"]))
+client_mock.fetch_corporate_actions = AsyncMock(return_value=[])
 
 # Setup SyncManager
 sm = SyncManager(client_mock)
+sm.etf_downloader.get_all_etf_symbols = AsyncMock(return_value={"MOCK_ETF"})
 
 async def test_all():
     # Helper to clean and initialize basic securities
     def reset_db_state():
         session.query(RawPrice).delete()
+        session.commit()
         session.query(Security).delete()
+        session.commit()
         session.query(SyncLog).delete()
         session.commit()
         
@@ -144,8 +151,8 @@ async def test_all():
     client_mock.download_bhavcopy_csv.return_value = dummy_bhav
     
     # Mock index download returning 404 for today
-    res = httpx.Response(status_code=404, request=httpx.Request("GET", "http://test"))
-    err = httpx.HTTPStatusError("404 Not Found", request=res.request, response=res)
+    from src.services.nse_client import HttpNotFoundError
+    err = HttpNotFoundError("http://test")
     client_mock.download_index_csv.side_effect = err
     
     # Mock today's date as 2026-06-10 for test stability
@@ -181,8 +188,8 @@ async def test_all():
     client_mock.download_bhavcopy_csv.return_value = dummy_bhav
     
     # Mock index download returning 500 (Internal Server Error)
-    res_500 = httpx.Response(status_code=500, request=httpx.Request("GET", "http://test"))
-    err_500 = httpx.HTTPStatusError("500 Internal Server Error", request=res_500.request, response=res_500)
+    from src.services.nse_client import HttpStatusError
+    err_500 = HttpStatusError(500, "http://test")
     client_mock.download_index_csv.side_effect = err_500
     
     with patch("src.services.sync_manager.date") as mock_date, \
@@ -203,10 +210,10 @@ async def test_all():
                 end_date=date(2026, 6, 10),
                 options={"stocks": True, "etfs": True, "indexes": True}
             )
-            assert False, "Expected HTTPStatusError to be raised!"
-        except httpx.HTTPStatusError as e:
+            assert False, "Expected HttpStatusError to be raised!"
+        except HttpStatusError as e:
             print(f"  Caught expected error: {e}")
-            assert e.response.status_code == 500
+            assert e.status_code == 500
             print("  [PASS] Correctly failed sync on 500 Internal Server Error.")
 
 if __name__ == "__main__":

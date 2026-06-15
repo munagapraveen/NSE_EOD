@@ -132,7 +132,7 @@ async def test_downloads():
             
         print("\nAll download and import functions passed successfully!")
 
-    except Exception as e:
+    except Exception:
         logger.exception("Test failed with exception:")
         sys.exit(1)
     finally:

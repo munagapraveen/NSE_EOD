@@ -1,10 +1,10 @@
-from datetime import date
-from sqlalchemy import select, func
+from sqlalchemy import select
 from nicegui import ui
 
 from src.db.engine import SessionLocal
 from src.models import Security, RawPrice, AdjustedPrice, Indicator, CorporateAction, MarketCap
 from src.ui.components.price_chart import create_candlestick_chart
+from src.utils.math_utils import truncate_decimal
 
 
 def get_security_details(symbol: str):
@@ -47,16 +47,25 @@ def get_security_details(symbol: str):
         
         # Fetch corporate actions
         actions = session.query(CorporateAction).filter(CorporateAction.security_id == sec.id).all()
-        actions_list = [
-            {
+        actions_list = []
+        for a in actions:
+            if a.action_type == 'BONUS':
+                label = f"BONUS {a.bonus_ratio_new}:{a.bonus_ratio_existing}"
+            elif a.action_type == 'SPLIT':
+                old_val = int(a.old_face_value) if a.old_face_value is not None else "?"
+                new_val = int(a.new_face_value) if a.new_face_value is not None else "?"
+                label = f"Split {old_val}:{new_val}"
+            else:
+                label = f"{a.action_type}"
+            
+            actions_list.append({
                 "date": a.ex_date,
-                "label": f"{a.action_type} {a.bonus_ratio_new}:{a.bonus_ratio_existing}" if a.action_type == 'BONUS' else f"Split {int(a.old_face_value)}:{int(a.new_face_value)}",
+                "label": label,
                 "description": a.description
-            } for a in actions
-        ]
+            })
         
         return sec, prices, actions_list
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
         return None, [], []
@@ -100,7 +109,7 @@ def render(symbol: str):
     # Latest metrics
     latest_price = float(prices[-1].raw_close) if prices else 0.0
     latest_adj = float(prices[-1].adj_close if prices[-1].adj_close is not None else prices[-1].raw_close) if prices else 0.0
-    latest_mcap_cr = round(float(prices[-1].market_cap) / 10000000.0, 2) if prices and prices[-1].market_cap else None
+    latest_mcap_cr = truncate_decimal(prices[-1].market_cap, 2) if prices and prices[-1].market_cap else None
 
     # Calculate change
     if len(prices) >= 2:

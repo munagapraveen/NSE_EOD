@@ -77,8 +77,16 @@ def render(symbol: str):
 
     # Extract chart data vectors
     dates = [p.trade_date.strftime("%Y-%m-%d") for p in prices]
-    ohlc = [[float(p.adj_open), float(p.adj_close), float(p.adj_low), float(p.adj_high)] for p in prices]
-    volumes = [int(p.adj_volume) if p.adj_volume else 0 for p in prices]
+    ohlc = [
+        [
+            float(p.adj_open if p.adj_open is not None else p.raw_open),
+            float(p.adj_close if p.adj_close is not None else p.raw_close),
+            float(p.adj_low if p.adj_low is not None else p.raw_low),
+            float(p.adj_high if p.adj_high is not None else p.raw_high),
+        ]
+        for p in prices
+    ]
+    volumes = [int(p.adj_volume if p.adj_volume is not None else p.raw_volume) for p in prices]
     
     # Store indicator vectors for overlay checkbox toggle
     all_smas = {
@@ -91,7 +99,7 @@ def render(symbol: str):
 
     # Latest metrics
     latest_price = float(prices[-1].raw_close) if prices else 0.0
-    latest_adj = float(prices[-1].adj_close) if prices else 0.0
+    latest_adj = float(prices[-1].adj_close if prices[-1].adj_close is not None else prices[-1].raw_close) if prices else 0.0
     latest_mcap_cr = round(float(prices[-1].market_cap) / 10000000.0, 2) if prices and prices[-1].market_cap else None
 
     # Calculate change
@@ -240,11 +248,11 @@ def render(symbol: str):
                 grid_rows.append({
                     "date": p.trade_date.strftime("%Y-%m-%d"),
                     "raw_close": float(p.raw_close),
-                    "adj_open": float(p.adj_open) if p.adj_open else None,
-                    "adj_high": float(p.adj_high) if p.adj_high else None,
-                    "adj_low": float(p.adj_low) if p.adj_low else None,
-                    "adj_close": float(p.adj_close) if p.adj_close else None,
-                    "adj_volume": int(p.adj_volume) if p.adj_volume else None,
+                    "adj_open": float(p.adj_open) if p.adj_open is not None else float(p.raw_open),
+                    "adj_high": float(p.adj_high) if p.adj_high is not None else float(p.raw_high),
+                    "adj_low": float(p.adj_low) if p.adj_low is not None else float(p.raw_low),
+                    "adj_close": float(p.adj_close) if p.adj_close is not None else float(p.raw_close),
+                    "adj_volume": int(p.adj_volume) if p.adj_volume is not None else int(p.raw_volume),
                     "sma_5": float(p.sma_5) if p.sma_5 else None,
                     "sma_10": float(p.sma_10) if p.sma_10 else None,
                     "sma_20": float(p.sma_20) if p.sma_20 else None,

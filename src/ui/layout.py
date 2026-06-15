@@ -25,7 +25,7 @@ def get_db_stats():
         last_sync = last_log.completed_at.strftime("%d-%b-%Y %H:%M") if last_log else "Never"
         
         return total_stocks, total_etfs, last_sync
-    except Exception as e:
+    except Exception:
         return 0, 0, "Error"
     finally:
         session.close()
@@ -73,6 +73,10 @@ def check_db_integrity() -> tuple[bool, str]:
                     
         return False, ""
     except Exception as e:
+        err_msg = str(e).lower()
+        if "lock" in err_msg or "could not set lock" in err_msg or "being used by another process" in err_msg:
+            logger.info(f"Database integrity check: database is busy/locked: {e}")
+            return False, ""
         logger.error(f"Database integrity check failed: {e}")
         return True, str(e)
     finally:

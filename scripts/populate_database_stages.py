@@ -5,9 +5,9 @@ import sys
 # Add root folder to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from sqlalchemy import update, func
+from sqlalchemy import update
 from src.db.engine import SessionLocal
-from src.models import Security, MarketCap, AdjustedPrice, Indicator
+from src.models import Security
 from src.services.price_adjuster import adjust_all_prices
 from src.services.market_cap import calculate_all_historical_market_caps
 from src.services.indicators import calculate_all_indicators

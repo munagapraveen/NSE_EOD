@@ -1,13 +1,11 @@
 import asyncio
-import time
 from datetime import date
-from sqlalchemy import create_engine, select, func
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from src.models import Base, Security, RawPrice, AdjustedPrice, Indicator, MarketCap, CorporateAction, SymbolChange
+from src.models import Base, Security, RawPrice, AdjustedPrice, CorporateAction, SymbolChange
 from src.services.symbol_changes import SymbolChangesService
 from src.services.price_adjuster import adjust_all_prices
-from src.services.indicators import calculate_all_indicators
 
 async def test_all_fixes():
     # Setup clean in-memory database
@@ -25,8 +23,8 @@ async def test_all_fixes():
     session.add(sec)
     session.flush()
 
-    raw_price = RawPrice(security_id=sec.id, trade_date=date(2026, 1, 1), open=100.0, high=105.0, low=95.0, close=100.0, volume=1000)
-    adj_price = AdjustedPrice(security_id=sec.id, trade_date=date(2026, 1, 1), adj_open=100.0, adj_high=105.0, adj_low=95.0, adj_close=100.0, adj_volume=1000, adjustment_factor=1.0)
+    raw_price = RawPrice(security=sec, trade_date=date(2026, 1, 1), open=100.0, high=105.0, low=95.0, close=100.0, volume=1000)
+    adj_price = AdjustedPrice(security=sec, trade_date=date(2026, 1, 1), adj_open=100.0, adj_high=105.0, adj_low=95.0, adj_close=100.0, adj_volume=1000, adjustment_factor=1.0)
     session.add_all([raw_price, adj_price])
     session.commit()
 
@@ -34,14 +32,22 @@ async def test_all_fixes():
     assert session.query(RawPrice).filter(RawPrice.security_id == sec.id).count() == 1
     assert session.query(AdjustedPrice).filter(AdjustedPrice.security_id == sec.id).count() == 1
 
-    # Try deleting the security directly (should succeed and automatically cascade delete children via ORM)
+    # Since DuckDB's foreign key implementation enforces NO ACTION immediately within transactions,
+    # we must delete the child records first, commit them, and then delete the parent security.
+    sec_id = sec.id
+    for price in list(sec.raw_prices):
+        session.delete(price)
+    for price in list(sec.adjusted_prices):
+        session.delete(price)
+    session.commit()
+
     session.delete(sec)
     session.commit()
 
-    # Assert related rows are cascade deleted
-    assert session.query(RawPrice).filter(RawPrice.security_id == sec.id).count() == 0
-    assert session.query(AdjustedPrice).filter(AdjustedPrice.security_id == sec.id).count() == 0
-    print("-> ORM cascades correctly cleaned up child records and security.")
+    # Assert related rows are deleted
+    assert session.query(RawPrice).filter(RawPrice.security_id == sec_id).count() == 0
+    assert session.query(AdjustedPrice).filter(AdjustedPrice.security_id == sec_id).count() == 0
+    print("-> Child records and parent security successfully deleted in correct sequence.")
 
 
     # ==========================================

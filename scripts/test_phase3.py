@@ -1,18 +1,17 @@
 import asyncio
 import sys
 import os
-from datetime import date, datetime
-from decimal import Decimal
+from datetime import date
 import pandas as pd
 
 # Append the project's root directory to the python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.db.engine import SessionLocal, engine
+from src.db.engine import SessionLocal
 from src.models import Security, RawPrice, AdjustedPrice, CorporateAction, SymbolChange
 from src.services.corporate_actions import parse_corporate_action_text, CorporateActionsService
 from src.services.symbol_changes import SymbolChangesService
-from src.services.price_adjuster import adjust_prices_for_security, adjust_all_prices
+from src.services.price_adjuster import adjust_prices_for_security
 from src.services.nse_client import NSEClient
 
 

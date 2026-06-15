@@ -1,0 +1,137 @@
+import httpx
+import re
+from bs4 import BeautifulSoup
+from loguru import logger
+from typing import Optional
+
+class BSEClient:
+    """Async client for fetching outstanding shares and metadata from BSE India website."""
+
+    def __init__(self):
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.bseindia.com/",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.bseindia.com"
+        }
+        self.client = httpx.AsyncClient(headers=self.headers, follow_redirects=True, timeout=15.0)
+
+    async def close(self):
+        """Close the HTTP client."""
+        await self.client.aclose()
+
+    async def lookup_scripcode_by_isin(self, isin: str) -> Optional[str]:
+        """
+        Lookup BSE scripcode using ISIN code.
+        Returns 6-digit scripcode if found, else None.
+        """
+        if not isin or not isinstance(isin, str) or len(isin.strip()) != 12:
+            return None
+        
+        isin = isin.strip()
+        url = f"https://api.bseindia.com/BseIndiaAPI/api/PeerSmartSearch/w?Type=SS&text={isin}"
+        
+        try:
+            r = await self.client.get(url)
+            r.raise_for_status()
+            
+            # Extract 6-digit scripcode using regex
+            match = re.search(r'(\d{6})</a>', r.text)
+            if match:
+                return match.group(1)
+            
+            match2 = re.search(r'(\d{6})', r.text)
+            if match2:
+                return match2.group(1)
+                
+            logger.warning(f"No scripcode matched in BSE search response for ISIN {isin}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to lookup BSE scripcode for ISIN {isin}: {e}")
+            return None
+
+    async def fetch_outstanding_shares(self, scrip_code: str) -> Optional[int]:
+        """
+        Fetch outstanding shares from the latest BSE shareholding pattern summary.
+        """
+        if not scrip_code:
+            return None
+            
+        url = f"https://api.bseindia.com/BseIndiaAPI/api/shpSecSummery_New/w?qtrid=&scripcode={scrip_code}"
+        
+        try:
+            r = await self.client.get(url)
+            r.raise_for_status()
+            
+            data = r.json()
+            html = data.get("Data", "")
+            
+            # If default empty qtrid returns empty HTML, try fallback quarter IDs
+            if not html:
+                fallback_qtrids = ["129", "128", "127", "126"]
+                logger.info(f"Default shareholding pattern for scrip {scrip_code} is empty. Trying fallbacks...")
+                for qtrid in fallback_qtrids:
+                    fallback_url = f"https://api.bseindia.com/BseIndiaAPI/api/shpSecSummery_New/w?qtrid={qtrid}&scripcode={scrip_code}"
+                    try:
+                        fr = await self.client.get(fallback_url)
+                        fr.raise_for_status()
+                        fdata = fr.json()
+                        fhtml = fdata.get("Data", "")
+                        if fhtml:
+                            html = fhtml
+                            logger.info(f"Successfully retrieved shareholding pattern for scrip {scrip_code} using qtrid={qtrid}")
+                            break
+                    except Exception as fe:
+                        logger.debug(f"Failed fallback fetch for scrip {scrip_code} (qtrid={qtrid}): {fe}")
+                        
+            if not html:
+                logger.warning(f"BSE shareholding pattern response for scrip {scrip_code} remains empty after fallbacks")
+                return None
+                
+            soup = BeautifulSoup(html, "html.parser")
+            rows = soup.find_all("tr")
+            
+            # 1. Find the header row containing "total no. shares held" to get column index dynamically
+            header_cells = None
+            for row in rows:
+                if row.find("table") is not None:
+                    continue
+                cells = [td.get_text(strip=True).lower() for td in row.find_all(["td", "th"])]
+                if "total no. shares held" in cells:
+                    header_cells = cells
+                    break
+                    
+            if not header_cells:
+                logger.warning(f"Header containing 'Total no. shares held' not found for scrip {scrip_code}")
+                return None
+                
+            col_idx = header_cells.index("total no. shares held")
+            
+            # 2. Find the td containing exactly "Grand Total"
+            grand_total_td = soup.find(lambda tag: tag.name == 'td' and tag.get_text(strip=True).lower() == 'grand total')
+            if not grand_total_td:
+                logger.warning(f"Grand Total cell not found in shareholding pattern for scrip {scrip_code}")
+                return None
+                
+            # Get sibling td elements in the same row
+            siblings = grand_total_td.find_next_siblings("td")
+            sibling_vals = [td.get_text(strip=True) for td in siblings]
+            
+            # The first column "Category of shareholder" is grand_total_td, so sibling index is col_idx - 1
+            target_sibling_idx = col_idx - 1
+            if target_sibling_idx >= len(sibling_vals):
+                logger.warning(f"Target column index {target_sibling_idx} exceeds sibling count {len(sibling_vals)} for scrip {scrip_code}")
+                return None
+                
+            total_shares_str = sibling_vals[target_sibling_idx]
+            
+            # Remove commas and convert to integer
+            shares = int(re.sub(r'[\s,]', '', total_shares_str))
+            if shares <= 0:
+                logger.warning(f"Parsed invalid non-positive outstanding shares ({shares}) for scrip {scrip_code}")
+                return None
+                
+            return shares
+        except Exception as e:
+            logger.error(f"Failed to fetch/parse outstanding shares for scrip {scrip_code}: {e}")
+            return None

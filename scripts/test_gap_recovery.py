@@ -21,7 +21,8 @@ Test 4 - is_incremental forced to False on gaps:
   WHEN:  The sync pipeline evaluates post-processing mode
   THEN:  is_incremental is forced to False (global recalculation)
 """
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from datetime import date

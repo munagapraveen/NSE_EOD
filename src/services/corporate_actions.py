@@ -1,7 +1,5 @@
 import re
-import math
 from datetime import date, datetime
-from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from loguru import logger
@@ -9,23 +7,20 @@ from loguru import logger
 from src.models import Security, CorporateAction
 from src.services.nse_client import NSEClient
 
-# SPLIT regex
-# Match: "Sub-Division/Stock Split From Rs.10/- Per Share To Re.1/- Per Share", "Rs. 10 to Rs. 2", "FV Split Rs.10 to Rs.5"
-# Match format: (digits) followed by (to/into) followed by (digits)
-SPLIT_PATTERN = re.compile(
-    r'(?:from|of|split)?\s*(?:Rs?e?\.?\s*)?(\d+(?:\.\d+)?)\s*/?-?\s*'
-    r'(?:per\s+share\s+)?'
-    r'(?:to|into)\s*(?:Rs?e?\.?\s*)?(\d+(?:\.\d+)?)',
+# SPLIT regexes
+# Find all numbers that are likely face values preceded by Rs, Re, FV, face value or followed by /-
+SPLIT_STRICT_PATTERN = re.compile(
+    r'(?:rs?e?\.?\s+|fv\s+|f\.v\.\s+|face\s+value\s+of\s+)(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*/-', 
+    re.IGNORECASE
+)
+SPLIT_FALLBACK_PATTERN = re.compile(
+    r'(?:rs?e?\.?\s*)?(\d+(?:\.\d+)?)\s*(?:/-)?\s+(?:to|into)\s*(?:rs?e?\.?\s*)?(\d+(?:\.\d+)?)',
     re.IGNORECASE
 )
 
-# BONUS regex
-# Match: "Bonus 1:1", "Bonus Issue In Ratio Of 1:1", "Bonus issue of 1:2"
-BONUS_PATTERN = re.compile(
-    r'bonus\s*(?:issue\s*)?(?:(?:in\s*)?(?:the\s*)?ratio\s*of\s*)?'
-    r'(\d+)\s*:\s*(\d+)',
-    re.IGNORECASE
-)
+# BONUS regexes
+BONUS_RATIO_PATTERN = re.compile(r'\b(\d+)\s*:\s*(\d+)\b')
+BONUS_FALLBACK_PATTERN = re.compile(r'\b(\d+)\s+(?:shares?\s+)?for\s+(?:each\s+|every\s+)?(\d+)\s+(?:shares?\b)?', re.IGNORECASE)
 
 
 def parse_action_date(date_str: str) -> date:
@@ -54,44 +49,92 @@ def parse_corporate_action_text(purpose: str, subject: str = "") -> dict:
     combined_text_lower = combined_text.lower()
     
     # 1. Check for Stock Split / Sub-Division
-    if "split" in combined_text_lower or "sub-division" in combined_text_lower or "sub division" in combined_text_lower:
-        match = SPLIT_PATTERN.search(combined_text)
-        if match:
-            try:
-                old_fv = float(match.group(1))
-                new_fv = float(match.group(2))
-                if old_fv > 0 and new_fv > 0:
-                    factor = old_fv / new_fv
+    if any(w in combined_text_lower for w in ["split", "sub-division", "sub division", "subdivision"]):
+        try:
+            matches = []
+            for m in SPLIT_STRICT_PATTERN.finditer(combined_text):
+                val_str = m.group(1) or m.group(2)
+                if val_str:
+                    matches.append(float(val_str))
+                    
+            if len(matches) >= 2:
+                old_fv = matches[0]
+                new_fv = matches[1]
+                if old_fv > new_fv > 0:
                     return {
                         "action_type": "SPLIT",
                         "old_face_value": old_fv,
                         "new_face_value": new_fv,
                         "bonus_ratio_new": None,
                         "bonus_ratio_existing": None,
-                        "adjustment_factor": factor
+                        "adjustment_factor": old_fv / new_fv
                     }
-            except Exception as e:
-                logger.warning(f"Failed parsing split details from text '{combined_text}': {e}")
+                elif new_fv >= old_fv > 0:
+                    # Reverse split / consolidation (new_fv > old_fv). Not supported for
+                    # automated price adjustment. Log it so it is visible in the log file.
+                    logger.warning(
+                        f"Reverse split detected (old_fv={old_fv}, new_fv={new_fv}) in text: "
+                        f"'{combined_text}'. Skipping — reverse splits are not processed automatically."
+                    )
+                    return None
+            
+            # Fallback to general split pattern if strict fails
+            match = SPLIT_FALLBACK_PATTERN.search(combined_text)
+            if match:
+                old_fv = float(match.group(1))
+                new_fv = float(match.group(2))
+                if old_fv > new_fv > 0:
+                    return {
+                        "action_type": "SPLIT",
+                        "old_face_value": old_fv,
+                        "new_face_value": new_fv,
+                        "bonus_ratio_new": None,
+                        "bonus_ratio_existing": None,
+                        "adjustment_factor": old_fv / new_fv
+                    }
+                elif new_fv >= old_fv > 0:
+                    # Reverse split / consolidation (new_fv > old_fv). Not supported for
+                    # automated price adjustment. Log it so it is visible in the log file.
+                    logger.warning(
+                        f"Reverse split detected (old_fv={old_fv}, new_fv={new_fv}) in text: "
+                        f"'{combined_text}'. Skipping — reverse splits are not processed automatically."
+                    )
+                    return None
+        except Exception as e:
+            logger.warning(f"Failed parsing split details from text '{combined_text}': {e}")
                 
     # 2. Check for Bonus Issue
     if "bonus" in combined_text_lower:
-        match = BONUS_PATTERN.search(combined_text)
-        if match:
-            try:
+        try:
+            match = BONUS_RATIO_PATTERN.search(combined_text)
+            if match:
                 new_ratio = int(match.group(1))
                 existing_ratio = int(match.group(2))
                 if new_ratio > 0 and existing_ratio > 0:
-                    factor = (existing_ratio + new_ratio) / existing_ratio
                     return {
                         "action_type": "BONUS",
                         "old_face_value": None,
                         "new_face_value": None,
                         "bonus_ratio_new": new_ratio,
                         "bonus_ratio_existing": existing_ratio,
-                        "adjustment_factor": factor
+                        "adjustment_factor": (existing_ratio + new_ratio) / existing_ratio
                     }
-            except Exception as e:
-                logger.warning(f"Failed parsing bonus details from text '{combined_text}': {e}")
+                    
+            match = BONUS_FALLBACK_PATTERN.search(combined_text)
+            if match:
+                new_ratio = int(match.group(1))
+                existing_ratio = int(match.group(2))
+                if new_ratio > 0 and existing_ratio > 0:
+                    return {
+                        "action_type": "BONUS",
+                        "old_face_value": None,
+                        "new_face_value": None,
+                        "bonus_ratio_new": new_ratio,
+                        "bonus_ratio_existing": existing_ratio,
+                        "adjustment_factor": (existing_ratio + new_ratio) / existing_ratio
+                    }
+        except Exception as e:
+            logger.warning(f"Failed parsing bonus details from text '{combined_text}': {e}")
 
     return None
 

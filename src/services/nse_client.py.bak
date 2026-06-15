@@ -1,13 +1,15 @@
 import asyncio
+import time
 import io
 import zipfile
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
 from loguru import logger
 from curl_cffi.requests import AsyncSession
 
-from config.constants import NSE_HEADERS, NSE_API_ACCEPT
+from config.constants import NSE_HEADERS, NSE_BASE_URL, NSE_API_ACCEPT
 from config.settings import settings
 
 
@@ -28,41 +30,43 @@ class NSEClient:
 
     def __init__(self):
         self._session: Optional[AsyncSession] = None
+        self._cookie_provider = None   # Lazy-loaded to avoid import cost at startup
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Session & Cookie Management
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _get_cookie_provider(self):
+        """Lazy-load NSECookieProvider to avoid Selenium import at module level."""
+        if self._cookie_provider is None:
+            from src.services.nse_cookie_provider import NSECookieProvider
+            self._cookie_provider = NSECookieProvider()
+        return self._cookie_provider
+
     async def _ensure_session(self, force_cookie_refresh: bool = False):
         """
-        Ensure curl_cffi session exists with fresh cookies.
-        Creates or re-creates the session and visits NSE homepage to establish cookies.
+        Ensure curl_cffi session exists with fresh cookies from the Chrome provider.
+        Creates or re-creates the session when cookies need to be refreshed.
         """
-        has_no_cookies = False
-        if self._session is not None:
-            try:
-                if not self._session.cookies or len(self._session.cookies) == 0:
-                    has_no_cookies = True
-            except Exception:
-                has_no_cookies = True
+        provider = self._get_cookie_provider()
+        cookies = await provider.get_cookies(force_refresh=force_cookie_refresh)
 
-        if self._session is None or force_cookie_refresh or has_no_cookies:
+        if self._session is None or force_cookie_refresh:
             # Close old session if refreshing
-            if self._session is not None:
+            if self._session is not None and force_cookie_refresh:
                 await self._session.close()
 
             self._session = AsyncSession(
                 headers=NSE_HEADERS,
                 impersonate=self.IMPERSONATE_BROWSER,
+                cookies=cookies,
                 timeout=30,
                 allow_redirects=True,
                 verify=True,
             )
-            # Visit homepage to establish cookies
-            await self._session.get("https://www.nseindia.com/")
             logger.debug(
                 f"NSEClient: Session {'refreshed' if force_cookie_refresh else 'created'} "
-                f"by visiting homepage directly."
+                f"with {len(cookies)} cookies."
             )
 
     async def _rate_limit(self):
@@ -74,7 +78,6 @@ class NSEClient:
         self,
         url: str,
         params: dict = None,
-        headers: dict = None,
         requires_cookies: bool = False,
         retries: int = None,
         accept_json: bool = False,
@@ -85,7 +88,6 @@ class NSEClient:
         Args:
             url: Full URL to fetch
             params: Query parameters
-            headers: Custom HTTP headers to merge
             requires_cookies: If True, use Chrome-acquired NSE session cookies
             retries: Number of retries (default: settings.nse_max_retries)
             accept_json: If True, override Accept header for API JSON calls
@@ -114,8 +116,6 @@ class NSEClient:
                 request_headers = {}
                 if accept_json:
                     request_headers["Accept"] = NSE_API_ACCEPT
-                if headers:
-                    request_headers.update(headers)
 
                 response = await self._session.get(url, params=params, headers=request_headers)
 
@@ -239,7 +239,6 @@ class NSEClient:
 
         response = await self._get(
             CORPORATE_ACTIONS_URL, params=params,
-            headers={"Referer": "https://www.nseindia.com/market-data/corporate-actions"},
             requires_cookies=True, accept_json=True
         )
         return response.json()

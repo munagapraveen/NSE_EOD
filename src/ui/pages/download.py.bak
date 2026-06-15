@@ -6,6 +6,10 @@ from nicegui import ui, run
 from src.db.engine import SessionLocal
 from src.services.nse_client import NSEClient
 from src.services.sync_manager import SyncManager
+from loguru import logger
+from sqlalchemy import func
+from src.models import RawPrice
+from config.settings import settings
 
 # Global state to prevent concurrent downloads
 _sync_task = None
@@ -21,7 +25,7 @@ class LogStreamer:
 
     async def start(self):
         self.active = True
-        log_file = "data/logs/app.log"
+        log_file = str(settings.log_file)
         
         # Ensure log file exists
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -33,18 +37,90 @@ class LogStreamer:
             # Seek to end of log
             f.seek(0, 2)
             while self.active:
-                line = f.readline()
-                if line:
-                    # Clean color/terminal codes if any
-                    clean_line = line.strip() + "\n"
-                    self.log_area.value += clean_line
-                    # Scroll to bottom
-                    self.log_area.run_method("scrollTo", 0, 999999)
-                else:
-                    await asyncio.sleep(0.3)
+                try:
+                    line = f.readline()
+                    if line:
+                        # Clean color/terminal codes if any
+                        clean_line = line.strip() + "\n"
+                        self.log_area.value += clean_line
+                        # Scroll to bottom
+                        self.log_area.run_method("scrollTo", 0, 999999)
+                    else:
+                        await asyncio.sleep(0.3)
+                except Exception:
+                    # Client disconnected or UI element deleted, stop streaming
+                    self.active = False
+                    break
 
     def stop(self):
         self.active = False
+
+
+def get_last_updated_date():
+    """Get the maximum trade date from raw_prices for stocks/ETFs and indexes (self-healing)."""
+    session = SessionLocal()
+    try:
+        from src.models import Security
+        
+        # Find dates with Stocks/ETFs but no Indexes
+        gap_stock = session.query(RawPrice.trade_date).distinct()\
+            .join(Security, Security.id == RawPrice.security_id)\
+            .filter(Security.security_type.in_(["STOCK", "ETF"]))\
+            .filter(Security.is_active == True)\
+            .filter(~Security.symbol.like("TEST%"))\
+            .filter(~Security.symbol.like("MOCK%"))\
+            .filter(~RawPrice.trade_date.in_(
+                session.query(RawPrice.trade_date)
+                .join(Security, Security.id == RawPrice.security_id)
+                .filter(Security.security_type == "INDEX")
+            ))\
+            .order_by(RawPrice.trade_date)\
+            .first()
+            
+        # Find dates with Indexes but no Stocks/ETFs
+        gap_index = session.query(RawPrice.trade_date).distinct()\
+            .join(Security, Security.id == RawPrice.security_id)\
+            .filter(Security.security_type == "INDEX")\
+            .filter(Security.is_active == True)\
+            .filter(~Security.symbol.like("TEST%"))\
+            .filter(~Security.symbol.like("MOCK%"))\
+            .filter(~RawPrice.trade_date.in_(
+                session.query(RawPrice.trade_date)
+                .join(Security, Security.id == RawPrice.security_id)
+                .filter(Security.security_type.in_(["STOCK", "ETF"]))
+            ))\
+            .order_by(RawPrice.trade_date)\
+            .first()
+            
+        first_gap = None
+        if gap_stock and gap_index:
+            first_gap = min(gap_stock[0], gap_index[0])
+        elif gap_stock:
+            first_gap = gap_stock[0]
+        elif gap_index:
+            first_gap = gap_index[0]
+            
+        if first_gap:
+            logger.info(f"Detected incomplete daily sync (gap date: {first_gap}). Resuming sync from gap date to backfill.")
+            return first_gap - timedelta(days=1)
+            
+        # 2. If no gaps, return the max date
+        max_stock = session.query(func.max(RawPrice.trade_date))\
+            .join(Security, Security.id == RawPrice.security_id)\
+            .filter(Security.security_type.in_(["STOCK", "ETF"]))\
+            .scalar()
+        max_index = session.query(func.max(RawPrice.trade_date))\
+            .join(Security, Security.id == RawPrice.security_id)\
+            .filter(Security.security_type == "INDEX")\
+            .scalar()
+        if max_stock and max_index:
+            return min(max_stock, max_index)
+        return max_stock or max_index
+    except Exception as e:
+        logger.error(f"Failed to fetch last updated date: {e}")
+        return None
+    finally:
+        session.close()
 
 
 def render():
@@ -57,9 +133,17 @@ def render():
     # State variables
     running = False
     
-    # Defaults
-    yesterday = date.today() - timedelta(days=1)
-    default_from = date(2025, 2, 1) # budget day default or last trading date
+    # Calculate default From Date based on database contents
+    last_update = get_last_updated_date()
+    
+    if last_update is None:
+        default_from_date = date(2024, 1, 1)
+        status_info = "Database is empty. Ready for Initial Ingestion."
+        disable_from = False
+    else:
+        default_from_date = last_update + timedelta(days=1)
+        status_info = f"Last Database Update: {last_update.strftime('%d-%b-%Y')}."
+        disable_from = True
 
     with ui.column().classes("w-full gap-6 p-6"):
         # Page Title
@@ -72,22 +156,27 @@ def render():
             ui.label("1. Select Ingestion Settings").classes("text-lg font-bold text-white")
             
             with ui.row().classes("w-full gap-8 wrap items-center"):
-                # Date pickers
+                # Date picker
                 with ui.row().classes("items-center gap-3"):
                     ui.label("From Date:").classes("text-sm text-slate-400")
-                    from_input = ui.input(value=default_from.strftime("%Y-%m-%d")).props("outlined dense dark type=date").classes("w-40")
+                    from_input = ui.input(value=default_from_date.strftime("%Y-%m-%d")).props("outlined dense dark type=date").classes("w-40")
+                    if disable_from:
+                        from_input.disable()
                     
-                    ui.label("To Date:").classes("text-sm text-slate-400 ml-4")
-                    to_input = ui.input(value=yesterday.strftime("%Y-%m-%d")).props("outlined dense dark type=date").classes("w-40")
+                    # Status Label next to it
+                    status_lbl_info = ui.label(status_info).classes("text-sm text-indigo-400 font-semibold ml-4")
 
             # Checkboxes for stages
             with ui.row().classes("w-full gap-6 mt-2 wrap"):
-                stocks_cb = ui.checkbox("Stocks (EQ/BE)", value=True).props("dark")
-                etfs_cb = ui.checkbox("ETFs", value=True).props("dark")
-                indexes_cb = ui.checkbox("Indexes", value=True).props("dark")
-                actions_cb = ui.checkbox("Corporate Actions", value=True).props("dark")
-                mcap_cb = ui.checkbox("Market Cap", value=True).props("dark")
-                indicators_cb = ui.checkbox("SMA Indicators", value=True).props("dark")
+                stocks_cb = ui.checkbox("Stocks (EQ/BE)", value=True).props("dark").disable()
+                etfs_cb = ui.checkbox("ETFs", value=True).props("dark").disable()
+                indexes_cb = ui.checkbox("Indexes", value=True).props("dark").disable()
+                actions_cb = ui.checkbox("Corporate Actions", value=True).props("dark").disable()
+                mcap_cb = ui.checkbox("Market Cap", value=True).props("dark").disable()
+                indicators_cb = ui.checkbox("SMA Indicators", value=True).props("dark").disable()
+
+            with ui.row().classes("w-full gap-6 mt-1 wrap"):
+                refresh_cb = ui.checkbox("Force Refresh Outstanding Shares", value=False).props("dark")
 
             # Buttons
             with ui.row().classes("w-full gap-4 mt-4"):
@@ -119,17 +208,14 @@ def render():
         # Trigger logic
         async def on_start():
             nonlocal running
+            if _sync_manager and _sync_manager.is_running:
+                ui.notify("A data synchronization task is already running in the background.", type="warning")
+                return
             running = True
             
             # Disable inputs
             from_input.disable()
-            to_input.disable()
-            stocks_cb.disable()
-            etfs_cb.disable()
-            indexes_cb.disable()
-            actions_cb.disable()
-            mcap_cb.disable()
-            indicators_cb.disable()
+            refresh_cb.disable()
             
             start_btn.disable()
             cancel_btn.enable()
@@ -144,7 +230,7 @@ def render():
             # Parse parameters
             try:
                 dt_from = date.fromisoformat(from_input.value)
-                dt_to = date.fromisoformat(to_input.value)
+                dt_to = date.today()
             except Exception as e:
                 ui.notify(f"Invalid date range format: {e}", type="negative")
                 on_finish("FAILED", "Invalid dates")
@@ -156,15 +242,20 @@ def render():
                 "indexes": indexes_cb.value,
                 "corporate_actions": actions_cb.value,
                 "market_cap": mcap_cb.value,
-                "indicators": indicators_cb.value
+                "indicators": indicators_cb.value,
+                "force_shares_refresh": refresh_cb.value
             }
 
             def handle_progress(stage, percentage, msg):
-                progress_bar.set_value(percentage / 100.0)
-                progress_lbl.set_text(f"[{stage}] {msg}")
-                # Optional visual change
-                if percentage >= 100.0:
-                    progress_card.classes("hidden")
+                try:
+                    progress_bar.set_value(percentage / 100.0)
+                    progress_lbl.set_text(f"[{stage}] {msg}")
+                    # Optional visual change
+                    if percentage >= 100.0:
+                        progress_card.classes("hidden")
+                except Exception:
+                    # Ignore UI update failures when client/page is reloaded or navigated away
+                    pass
 
             # Run sync manager in background
             session = SessionLocal()
@@ -184,18 +275,21 @@ def render():
             running = False
             log_streamer.stop()
             
-            # Enable inputs
-            from_input.enable()
-            to_input.enable()
-            stocks_cb.enable()
-            etfs_cb.enable()
-            indexes_cb.enable()
-            actions_cb.enable()
-            mcap_cb.enable()
-            indicators_cb.enable()
-            
+            # Enable/Disable based on new database state
+            last_up = get_last_updated_date()
+            if last_up is None:
+                from_input.set_value("2024-01-01")
+                from_input.enable()
+                status_lbl_info.set_text("Database is empty. Ready for Initial Ingestion.")
+            else:
+                next_st = last_up + timedelta(days=1)
+                from_input.set_value(next_st.strftime("%Y-%m-%d"))
+                from_input.disable()
+                status_lbl_info.set_text(f"Last Database Update: {last_up.strftime('%d-%b-%Y')}.")
+                
             start_btn.enable()
             cancel_btn.disable()
+            refresh_cb.enable()
             progress_card.classes(add="hidden")
 
             # Notify user

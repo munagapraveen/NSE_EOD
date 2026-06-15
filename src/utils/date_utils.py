@@ -3,7 +3,7 @@ import os
 from datetime import date, timedelta, datetime
 from typing import Set, List
 from loguru import logger
-from services.nse_client import NSEClient
+from src.services.nse_client import NSEClient
 
 
 def get_calendar_days(start_date: date, end_date: date) -> List[date]:

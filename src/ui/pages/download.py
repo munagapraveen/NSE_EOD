@@ -1,7 +1,7 @@
 import asyncio
 import os
 from datetime import date, timedelta
-from nicegui import ui, run
+from nicegui import ui
 
 from src.db.engine import SessionLocal
 from src.services.nse_client import NSEClient
@@ -18,10 +18,12 @@ _log_listener_active = False
 
 
 class LogStreamer:
-    """Read logs from file and push to textarea in real time."""
-    def __init__(self, log_area):
+    """Read logs from file and push to textarea in real time, with a limit of 1000 lines to prevent browser freeze."""
+    def __init__(self, log_area, max_lines=1000):
         self.log_area = log_area
         self.active = False
+        import collections
+        self.buffer = collections.deque(maxlen=max_lines)
 
     async def start(self):
         self.active = True
@@ -36,15 +38,25 @@ class LogStreamer:
         with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
             # Seek to end of log
             f.seek(0, 2)
+            # Clear initial value to start fresh
+            self.log_area.value = ""
+            self.buffer.clear()
             while self.active:
                 try:
                     line = f.readline()
                     if line:
-                        # Clean color/terminal codes if any
-                        clean_line = line.strip() + "\n"
-                        self.log_area.value += clean_line
+                        clean_line = line.strip()
+                        self.buffer.append(clean_line)
+                        self.log_area.value = "\n".join(self.buffer) + "\n"
                         # Scroll to bottom
-                        self.log_area.run_method("scrollTo", 0, 999999)
+                        try:
+                            await self.log_area.client.run_javascript(
+                                f'const el = document.getElementById("c{self.log_area.id}"); '
+                                'if (el) { const ta = el.querySelector("textarea"); if (ta) ta.scrollTop = ta.scrollHeight; }',
+                                timeout=1.0
+                            )
+                        except Exception as js_err:
+                            logger.debug(f"Failed to scroll log area: {js_err}")
                     else:
                         await asyncio.sleep(0.3)
                 except Exception:
@@ -62,26 +74,35 @@ def get_last_updated_date():
     try:
         from src.models import Security
         
-        # 1. Check for any date gaps (incomplete daily syncs)
         # Find dates with Stocks/ETFs but no Indexes
         gap_stock = session.query(RawPrice.trade_date).distinct()\
             .join(Security, Security.id == RawPrice.security_id)\
             .filter(Security.security_type.in_(["STOCK", "ETF"]))\
+            .filter(Security.is_active == True)\
+            .filter(~Security.symbol.like("TEST%"))\
+            .filter(~Security.symbol.like("MOCK%"))\
             .filter(~RawPrice.trade_date.in_(
                 session.query(RawPrice.trade_date)
                 .join(Security, Security.id == RawPrice.security_id)
                 .filter(Security.security_type == "INDEX")
-            )).first()
+            ))\
+            .order_by(RawPrice.trade_date)\
+            .first()
             
         # Find dates with Indexes but no Stocks/ETFs
         gap_index = session.query(RawPrice.trade_date).distinct()\
             .join(Security, Security.id == RawPrice.security_id)\
             .filter(Security.security_type == "INDEX")\
+            .filter(Security.is_active == True)\
+            .filter(~Security.symbol.like("TEST%"))\
+            .filter(~Security.symbol.like("MOCK%"))\
             .filter(~RawPrice.trade_date.in_(
                 session.query(RawPrice.trade_date)
                 .join(Security, Security.id == RawPrice.security_id)
                 .filter(Security.security_type.in_(["STOCK", "ETF"]))
-            )).first()
+            ))\
+            .order_by(RawPrice.trade_date)\
+            .first()
             
         first_gap = None
         if gap_stock and gap_index:
@@ -157,14 +178,10 @@ def render():
                     # Status Label next to it
                     status_lbl_info = ui.label(status_info).classes("text-sm text-indigo-400 font-semibold ml-4")
 
-            # Checkboxes for stages
-            with ui.row().classes("w-full gap-6 mt-2 wrap"):
-                stocks_cb = ui.checkbox("Stocks (EQ/BE)", value=True).props("dark").disable()
-                etfs_cb = ui.checkbox("ETFs", value=True).props("dark").disable()
-                indexes_cb = ui.checkbox("Indexes", value=True).props("dark").disable()
-                actions_cb = ui.checkbox("Corporate Actions", value=True).props("dark").disable()
-                mcap_cb = ui.checkbox("Market Cap", value=True).props("dark").disable()
-                indicators_cb = ui.checkbox("SMA Indicators", value=True).props("dark").disable()
+
+
+            with ui.row().classes("w-full gap-6 mt-1 wrap"):
+                refresh_cb = ui.checkbox("Force Refresh Outstanding Shares", value=False).props("dark")
 
             # Buttons
             with ui.row().classes("w-full gap-4 mt-4"):
@@ -192,14 +209,19 @@ def render():
                 .classes("w-full h-[320px] bg-[#14141e] text-slate-300 font-mono text-xs p-4 rounded-lg overflow-y-auto")
 
         log_streamer = LogStreamer(log_area)
+        ui.context.client.on_disconnect(log_streamer.stop)
 
         # Trigger logic
         async def on_start():
             nonlocal running
+            if _sync_manager and _sync_manager.is_running:
+                ui.notify("A data synchronization task is already running in the background.", type="warning")
+                return
             running = True
             
             # Disable inputs
             from_input.disable()
+            refresh_cb.disable()
             
             start_btn.disable()
             cancel_btn.enable()
@@ -221,12 +243,13 @@ def render():
                 return
 
             options = {
-                "stocks": stocks_cb.value,
-                "etfs": etfs_cb.value,
-                "indexes": indexes_cb.value,
-                "corporate_actions": actions_cb.value,
-                "market_cap": mcap_cb.value,
-                "indicators": indicators_cb.value
+                "stocks": True,
+                "etfs": True,
+                "indexes": True,
+                "corporate_actions": True,
+                "market_cap": True,
+                "indicators": True,
+                "force_shares_refresh": refresh_cb.value
             }
 
             def handle_progress(stage, percentage, msg):
@@ -251,7 +274,8 @@ def render():
                 logger.error(f"Ingestion pipeline failed: {ex}")
                 on_finish("FAILED", str(ex))
             finally:
-                session.close()
+                if session.is_active:
+                    session.close()
 
         def on_finish(status, message):
             nonlocal running
@@ -272,6 +296,7 @@ def render():
                 
             start_btn.enable()
             cancel_btn.disable()
+            refresh_cb.enable()
             progress_card.classes(add="hidden")
 
             # Notify user

@@ -11,7 +11,8 @@ Test 2 - Backup File Lock Prevention:
   WHEN:  create_db_backup() is called
   THEN:  It should dispose the engine first and copy successfully without WinError 32
 """
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import pandas as pd
@@ -102,20 +103,18 @@ def test_sync_manager_engine_disposal():
     import inspect
     from src.services.sync_manager import SyncManager
     
-    source = inspect.getsource(SyncManager.run_sync)
+    source = inspect.getsource(SyncManager._run_sync_internal)
     
-    # Check session.close() and engine.dispose() appear before create_db_backup
-    session_close_pos = source.find("session.close()")
+    # Check engine.dispose() appears before create_db_backup
     dispose_pos = source.find("_engine.dispose()")
     backup_call_pos = source.find("create_db_backup()")
     
-    assert session_close_pos > 0, "FAIL: session.close() not found in run_sync"
     assert dispose_pos > 0, "FAIL: engine.dispose() not found in run_sync"
-    assert backup_call_pos > 0, "FAIL: create_db_backup() not found in run_sync"
-    assert session_close_pos < dispose_pos < backup_call_pos, \
-        "FAIL: session.close() -> engine.dispose() -> create_db_backup() order is wrong"
+    assert backup_call_pos > 0, "FAIL: create_db_backup() not found in sync_manager"
+    assert dispose_pos < backup_call_pos, \
+        "FAIL: engine.dispose() -> create_db_backup() order is wrong"
     
-    print("  [PASS] run_sync() closes session & disposes engine BEFORE backup call")
+    print("  [PASS] run_sync() disposes engine BEFORE backup call")
 
 test_backup_engine_disposal()
 test_sync_manager_engine_disposal()

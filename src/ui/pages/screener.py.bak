@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date
 import pandas as pd
 from nicegui import ui
@@ -156,8 +157,9 @@ def render():
             
             session = SessionLocal()
             try:
-                # 1. Execute Sharpe Screener calculation
-                df_all = run_sharpe_screener(
+                # 1. Execute Sharpe Screener calculation on worker thread
+                df_all = await asyncio.to_thread(
+                    run_sharpe_screener,
                     session=session,
                     target_date=t_date,
                     long_months=long_val,

@@ -1,9 +1,10 @@
+import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from sqlalchemy import select, func
+from sqlalchemy import select, func, and_
 from sqlalchemy.orm import Session
 from loguru import logger
 from openpyxl import Workbook
@@ -11,7 +12,6 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from src.models import Security, RawPrice, AdjustedPrice, MarketCap
-from src.utils.math_utils import truncate_decimal
 
 
 def get_closest_trading_date(session: Session, target_date: date) -> date:
@@ -68,7 +68,7 @@ def run_sharpe_screener(
     logger.info(f"Running Sharpe Screener relative to trading date: {t_date}")
     
     # Step 1: Filter active stocks with Market Cap >= mcap_filter_cr
-    mcap_threshold_cr = mcap_filter_cr  # Database stores market cap in Crores directly
+    mcap_threshold_bps = mcap_filter_cr * 10_000_000.0  # Convert Cr to absolute Rupees
     
     mcap_query = (
         select(
@@ -84,7 +84,7 @@ def run_sharpe_screener(
         .where(Security.is_active == True)
         .where(Security.is_delisted == False)
         .where(MarketCap.trade_date == t_date)
-        .where(MarketCap.market_cap >= mcap_threshold_cr)
+        .where(MarketCap.market_cap >= mcap_threshold_bps)
     )
     
     mcap_rows = session.execute(mcap_query).all()
@@ -98,7 +98,7 @@ def run_sharpe_screener(
             "company_name": r.company_name or "-",
             "isin": r.isin or "-",
             "industry": r.industry or "-",
-            "market_cap_cr": truncate_decimal(r.market_cap, 2)
+            "market_cap_cr": round(float(r.market_cap) / 10_000_000.0, 2)
         }
         for r in mcap_rows
     }
@@ -132,7 +132,7 @@ def run_sharpe_screener(
     t_6m = get_next_available_trading_date(trading_dates, target_6m_dt)
     t_12m = get_next_available_trading_date(trading_dates, target_12m_dt)
     
-    logger.info("Target Dates Resolved:")
+    logger.info(f"Target Dates Resolved:")
     logger.info(f"  3M Lookback Date  : {t_3m} (requested: {target_3m_dt})")
     logger.info(f"  6M Lookback Date  : {t_6m} (requested: {target_6m_dt})")
     logger.info(f"  12M Lookback Date : {t_12m} (requested: {target_12m_dt})")
@@ -410,10 +410,9 @@ PCT_COLS = {"ROC_annual", "ROC_3", "ROC_6", "away_52wh"}
 INT_COLS = {"sharpe_6_rank", "sharpe_3_rank", "Avg_sharpe_6_3_Rank", "total_circuit_hits_3m"}
 
 
-def _write_excel_sheet(ws, df, title, header_fill, alt_fill, target_date: date, long_months=6, short_months=3):
+def _write_excel_sheet(ws, df, title, header_fill, alt_fill, long_months=6, short_months=3):
     cols = list(df.columns)
     today_str = datetime.today().strftime("%d %b %Y")
-    target_date_str = target_date.strftime("%d %b %Y")
     
     # Set headers map with dynamic months labels
     friendly_headers = dict(FRIENDLY_HEADERS)
@@ -427,7 +426,7 @@ def _write_excel_sheet(ws, df, title, header_fill, alt_fill, target_date: date, 
 
     # Merge title row
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(cols))
-    title_cell = ws.cell(row=1, column=1, value=f"{title}  |  Screening Date: {target_date_str}  |  Exported: {today_str}")
+    title_cell = ws.cell(row=1, column=1, value=f"{title}  |  Screened: {today_str}")
     title_cell.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     title_cell.fill = header_fill
     title_cell.alignment = CENTER
@@ -507,7 +506,6 @@ def export_screener_to_excel(
         title=f"NSE Sharpe Screener -- All Ranked Stocks ({long_months}M / {short_months}M)",
         header_fill=HEADER_FILL,
         alt_fill=ALT_FILL,
-        target_date=target_date,
         long_months=long_months,
         short_months=short_months
     )
@@ -520,10 +518,9 @@ def export_screener_to_excel(
         _write_excel_sheet(
             ws2,
             df_filtered,
-            title="Filtered Watchlist  |  3M ROC > 20%  |  Close >= 75% of 52WH  |  Circuit Hits <= 10",
+            title=f"Filtered Watchlist  |  3M ROC > 20%  |  Close >= 75% of 52WH  |  Circuit Hits <= 10",
             header_fill=FILTER_FILL,
             alt_fill=ALT_FILL_FILTER,
-            target_date=target_date,
             long_months=long_months,
             short_months=short_months
         )

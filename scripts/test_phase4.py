@@ -2,8 +2,6 @@ import asyncio
 import sys
 import os
 from datetime import date, timedelta
-from decimal import Decimal
-import pandas as pd
 
 # Append the project's root directory to the python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

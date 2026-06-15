@@ -146,7 +146,7 @@ async def calculate_incremental_indicators_for_range(session: Session, start_dat
     # Load all adjusted prices in the range in a single query, excluding affected securities
     query = (
         select(AdjustedPrice.security_id, AdjustedPrice.trade_date, AdjustedPrice.adj_close)
-        .where(AdjustedPrice.trade_date >= start_date - timedelta(days=365))
+        .where(AdjustedPrice.trade_date >= start_date - timedelta(days=450))
         .where(AdjustedPrice.trade_date <= end_date)
     )
     if affected_sec_ids:

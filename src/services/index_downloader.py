@@ -1,13 +1,13 @@
 import math
 from datetime import date
-import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from loguru import logger
 
-from src.models import Security, RawPrice
+from src.models import Security
 from src.db.repository import bulk_upsert_raw_prices
 from src.services.nse_client import NSEClient
+from src.utils.math_utils import safe_float, safe_int
 
 
 class IndexDownloader:
@@ -58,8 +58,8 @@ class IndexDownloader:
         try:
             df = await self.client.download_index_csv(date_str)
         except Exception as e:
-            import httpx
-            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+            from src.services.nse_client import HttpNotFoundError
+            if isinstance(e, HttpNotFoundError):
                 logger.warning(f"No index data found for {trade_date.isoformat()} (Weekend/Holiday/Delayed). Skipping.")
                 return 0
             logger.error(f"Failed to download index data for {trade_date.isoformat()}: {e}")
@@ -86,8 +86,10 @@ class IndexDownloader:
                 logger.error(f"Index file missing column: {required_col}. Columns: {list(df.columns)}")
                 raise ValueError(f"Index file missing required column: {required_col}")
 
-        # Process all indexes dynamically (no whitelist filter)
-        df_clean = df.copy()
+        # Filter for tracked indexes only
+        from config.constants import TRACKED_INDEXES
+        tracked_set = {name.upper() for name in TRACKED_INDEXES}
+        df_clean = df[df[name_col].str.strip().str.upper().isin(tracked_set)].copy()
 
         # Create index mapping for all unique index names in the file
         names_found = set(df_clean[name_col].str.strip())
@@ -104,24 +106,6 @@ class IndexDownloader:
             if not idx_id:
                 continue
 
-            # Safe conversions
-            def safe_float(val, default=0.0):
-                try:
-                    f = float(val)
-                    if math.isnan(f):
-                        return 0.0
-                    return f
-                except:
-                    return default
-
-            def safe_int(val, default=0):
-                try:
-                    i = int(val)
-                    if math.isnan(i):
-                        return 0
-                    return i
-                except:
-                    return default
 
             record = {
                 "security_id": idx_id,

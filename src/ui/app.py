@@ -87,6 +87,44 @@ def create_app():
         logger.info("Application shutting down: Disposing database engine connections.")
         engine.dispose()
 
+def patch_proactor_connection_lost():
+    """Monkeypatch ProactorEventLoop to ignore noisy connection lost exceptions on Windows."""
+    import sys
+    if sys.platform == "win32":
+        import asyncio.proactor_events
+        import socket
+        from loguru import logger
+
+        if getattr(asyncio.proactor_events._ProactorBasePipeTransport, "_patched_connection_lost", False):
+            return
+
+        def patched_call_connection_lost(self, exc):
+            if self._called_connection_lost:
+                return
+            try:
+                self._protocol.connection_lost(exc)
+            finally:
+                if self._sock is not None:
+                    if hasattr(self._sock, 'shutdown') and self._sock.fileno() != -1:
+                        try:
+                            self._sock.shutdown(socket.SHUT_RDWR)
+                        except (OSError, AttributeError):
+                            pass
+                    try:
+                        self._sock.close()
+                    except (OSError, AttributeError):
+                        pass
+                    self._sock = None
+                
+                server = self._server
+                if server is not None:
+                    server._detach(self)
+                    self._server = None
+                self._called_connection_lost = True
+
+        asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost = patched_call_connection_lost
+        asyncio.proactor_events._ProactorBasePipeTransport._patched_connection_lost = True
+        logger.info("Patched asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost to ignore Windows-specific socket shutdown exceptions.")
 
 
 def main():
@@ -94,6 +132,9 @@ def main():
     import os
     from loguru import logger
     from config.settings import settings
+    
+    # Apply monkeypatch for Windows asyncio proactor connection lost noise
+    patch_proactor_connection_lost()
     
     # Configure file logging for real-time console streaming
     os.makedirs(os.path.dirname(settings.log_file), exist_ok=True)
@@ -104,6 +145,21 @@ def main():
         retention="10 days",
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
     )
+    
+    # Initialize/update database tables on startup
+    from src.models import Base
+    try:
+        logger.info("Initializing database schemas...")
+        Base.metadata.create_all(bind=engine)
+    except Exception as db_init_err:
+        logger.warning(f"Database schema initialization warning: {db_init_err}")
+
+    # Align database auto-increment sequences with max IDs
+    from src.utils.db_utils import align_database_sequences
+    try:
+        align_database_sequences(engine)
+    except Exception as db_align_err:
+        logger.warning(f"Database sequence alignment warning: {db_align_err}")
     
     # Run database integrity check on startup
     from src.ui.layout import check_db_integrity

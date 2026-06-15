@@ -1,10 +1,9 @@
 import os
 import sys
 import glob
-import shutil
 import pytest
 from datetime import date
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 # Append project root
@@ -12,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import settings
 from src.models import Base, Security, RawPrice
-from src.utils.backup_utils import create_db_backup, prune_old_backups, restore_db_from_backup
+from src.utils.backup_utils import create_db_backup, prune_old_backups
 from scripts.db_recovery import run_db_rebuild
 
 def test_database_resilience():

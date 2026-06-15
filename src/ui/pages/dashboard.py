@@ -1,6 +1,5 @@
 import os
-from datetime import date
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func
 from nicegui import ui
 
 from src.db.engine import SessionLocal
@@ -37,7 +36,7 @@ def get_dashboard_stats():
             "last_sync": last_sync,
             "db_size": db_size
         }
-    except Exception as e:
+    except Exception:
         return {"stocks": 0, "etfs": 0, "indexes": 0, "last_sync": "Error", "db_size": "0.00 MB"}
     finally:
         session.close()
@@ -81,7 +80,7 @@ def get_top_gainers_losers(limit: int = 5):
         losers = sorted(stock_changes, key=lambda x: x["change_pct"])[:limit]
         
         return gainers, losers
-    except Exception as e:
+    except Exception:
         return [], []
     finally:
         session.close()
@@ -102,7 +101,7 @@ def get_recent_activity(limit: int = 10):
                 "duration": f"{(log.completed_at - log.started_at).seconds}s" if log.completed_at else "-"
             } for log in logs
         ]
-    except Exception as e:
+    except Exception:
         return []
     finally:
         session.close()

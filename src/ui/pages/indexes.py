@@ -40,7 +40,7 @@ def get_indexes_list():
                 "market_cap": None  # Indexes do not have market cap
             })
         return data
-    except Exception as e:
+    except Exception:
         return []
     finally:
         session.close()

@@ -10,7 +10,7 @@ class MarketCap(Base):
     )
 
     id = Column(Integer, Sequence("market_cap_id_seq"), primary_key=True)
-    security_id = Column(Integer, nullable=False, index=True)
+    security_id = Column(Integer, ForeignKey("securities.id"), nullable=False, index=True)
     trade_date = Column(Date, nullable=False, index=True)
     close_price = Column(Numeric(12, 2), nullable=False)
     issued_shares = Column(BigInteger, nullable=False)

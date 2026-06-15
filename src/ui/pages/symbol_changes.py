@@ -38,7 +38,7 @@ def get_symbol_changes():
                 "applied_at": applied_at_str
             })
         return data
-    except Exception as e:
+    except Exception:
         return []
     finally:
         session.close()

@@ -1,24 +1,21 @@
 from datetime import date
 import asyncio
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from sqlalchemy.orm import Session
 from loguru import logger
 
-from src.models import Security, RawPrice, AdjustedPrice, MarketCap
+from src.models import Security, RawPrice, AdjustedPrice, MarketCap, HistoricalShare
+from src.utils.math_utils import truncate_decimal
 
 
 async def calculate_historical_market_cap(session: Session, security_id: int, current_issued_shares: int) -> int:
     """
-    Calculate historical market cap for a specific stock by reverse-engineering
-    historical shares outstanding using the price adjustment factor.
+    Calculate historical market cap for a specific stock by retrieving direct historical
+    quarterly outstanding shares from the database, falling back to reverse-engineering.
     
     Returns:
         Number of market cap records written.
     """
-    if not current_issued_shares or current_issued_shares <= 0:
-        logger.warning(f"Skipping market cap for security ID {security_id}: no valid current issued shares.")
-        return 0
-
     # 1. Fetch raw close prices and their corresponding adjustment factors by joining raw_prices and adjusted_prices
     query = (
         select(RawPrice.trade_date, RawPrice.close, AdjustedPrice.adjustment_factor)
@@ -34,30 +31,87 @@ async def calculate_historical_market_cap(session: Session, security_id: int, cu
     if not results:
         return 0
 
+    # 2. Fetch all historical shares for this security
+    hist_shares_query = (
+        select(HistoricalShare.quarter_date, HistoricalShare.issued_shares)
+        .where(HistoricalShare.security_id == security_id)
+        .order_by(HistoricalShare.quarter_date.asc())
+    )
+    hist_shares_rows = session.execute(hist_shares_query).all()
+    hist_shares = [(r.quarter_date, r.issued_shares) for r in hist_shares_rows]
+    
+    # Map adjustment factor at the quarter_date for each historical quarter
+    # using closest preceding/succeeding trading date factor resolution
+    quarter_dates = [q_date for q_date, _ in hist_shares]
+    factor_map = {}
+    for q_date in quarter_dates:
+        # Find closest preceding factor in DB
+        f = session.execute(
+            select(AdjustedPrice.adjustment_factor)
+            .where(AdjustedPrice.security_id == security_id)
+            .where(AdjustedPrice.trade_date <= q_date)
+            .order_by(AdjustedPrice.trade_date.desc())
+            .limit(1)
+        ).scalar()
+        
+        if f is None:
+            # Fallback to closest succeeding factor in DB (e.g. database starts after quarter end)
+            f = session.execute(
+                select(AdjustedPrice.adjustment_factor)
+                .where(AdjustedPrice.security_id == security_id)
+                .where(AdjustedPrice.trade_date >= q_date)
+                .order_by(AdjustedPrice.trade_date.asc())
+                .limit(1)
+            ).scalar()
+            
+        factor_map[q_date] = float(f) if f is not None else 1.0
+
     records = []
     for row in results:
         trade_date = row.trade_date
         raw_close = float(row.close)
-        factor = float(row.adjustment_factor)
-
-        # Handle edge cases where factor is invalid or zero (should not happen)
+        factor = float(row.adjustment_factor) if row.adjustment_factor else 1.0
         if factor <= 0:
             factor = 1.0
 
-        # Reverse-engineer shares outstanding: historical = current / cumulative_factor
-        historical_shares = int(round(current_issued_shares / factor))
-        mcap_value = round(historical_shares * raw_close, 2)
+        # Try to resolve shares outstanding from the closest preceding quarter
+        resolved_shares = None
+        for q_date, shares in reversed(hist_shares):
+            if q_date <= trade_date:
+                q_factor = factor_map.get(q_date, 1.0)
+                if q_factor <= 0:
+                    q_factor = 1.0
+                # Adjust for any splits/bonuses between the quarter and trade_date
+                resolved_shares = int(round(shares * (q_factor / factor)))
+                break
+                
+        # Fallback 1: If trade_date is earlier than the first quarter record, use the first quarter count
+        if resolved_shares is None and hist_shares:
+            q_date, shares = hist_shares[0]
+            q_factor = factor_map.get(q_date, 1.0)
+            if q_factor <= 0:
+                q_factor = 1.0
+            resolved_shares = int(round(shares * (q_factor / factor)))
+            
+        # Fallback 2: If no quarterly records exist at all, reverse-engineer using current shares
+        if resolved_shares is None:
+            if not current_issued_shares or current_issued_shares <= 0:
+                continue
+            resolved_shares = int(round(current_issued_shares / factor))
+
+        mcap_value = truncate_decimal((resolved_shares * raw_close) / 10_000_000.0, 2)
+        close_price_truncated = truncate_decimal(raw_close, 2)
 
         records.append({
             "security_id": security_id,
             "trade_date": trade_date,
-            "close_price": raw_close,
-            "issued_shares": historical_shares,
+            "close_price": close_price_truncated,
+            "issued_shares": resolved_shares,
             "market_cap": mcap_value,
-            "shares_source": "REVERSE_ENGINEERED"
+            "shares_source": "BSE_QUARTERLY_SHP" if hist_shares else "REVERSE_ENGINEERED"
         })
 
-    # 2. Delete existing records for this security
+    # Delete existing records for this security
     session.execute(
         delete(MarketCap).where(MarketCap.security_id == security_id)
     )
@@ -68,50 +122,9 @@ async def calculate_historical_market_cap(session: Session, security_id: int, cu
 
     logger.debug(
         f"Calculated historical market cap for security ID {security_id}: "
-        f"{len(records)} records saved (source: REVERSE_ENGINEERED)."
+        f"{len(records)} records saved (source: {'BSE_QUARTERLY_SHP' if hist_shares else 'REVERSE_ENGINEERED'})."
     )
     return len(records)
-
-
-async def calculate_incremental_market_cap(
-    session: Session, security_id: int, trade_date: date, raw_close: float, last_known_shares: int
-) -> bool:
-    """
-    Calculate and insert/update market cap for a single day during daily incremental updates.
-    
-    Returns:
-        True if successfully written.
-    """
-    if not last_known_shares or last_known_shares <= 0:
-        return False
-
-    mcap_value = round(last_known_shares * float(raw_close), 2)
-    
-    # Check if record already exists
-    existing = session.execute(
-        select(MarketCap)
-        .where(MarketCap.security_id == security_id)
-        .where(MarketCap.trade_date == trade_date)
-    ).scalar_one_or_none()
-
-    if existing:
-        existing.close_price = round(float(raw_close), 2)
-        existing.issued_shares = last_known_shares
-        existing.market_cap = mcap_value
-        existing.shares_source = "NSE_QUOTE"
-    else:
-        new_record = MarketCap(
-            security_id=security_id,
-            trade_date=trade_date,
-            close_price=round(float(raw_close), 2),
-            issued_shares=last_known_shares,
-            market_cap=mcap_value,
-            shares_source="NSE_QUOTE"
-        )
-        session.add(new_record)
-
-    session.commit()
-    return True
 
 
 async def calculate_all_historical_market_caps(session: Session) -> int:
@@ -186,7 +199,88 @@ async def calculate_incremental_market_caps_for_range(session: Session, start_da
             total_written += written
         await asyncio.sleep(0.01)
 
-    # 3. For all other stocks, calculate market cap only for the new dates
+    # 3. Fetch all historical shares for active stocks
+    hist_shares_query = (
+        select(HistoricalShare.security_id, HistoricalShare.quarter_date, HistoricalShare.issued_shares)
+        .order_by(HistoricalShare.security_id, HistoricalShare.quarter_date.asc())
+    )
+    hist_shares_rows = session.execute(hist_shares_query).all()
+    
+    from collections import defaultdict
+    shares_by_sec = defaultdict(list)
+    for r in hist_shares_rows:
+        shares_by_sec[r.security_id].append((r.quarter_date, r.issued_shares))
+
+    # Fetch adjustment factors for the unique quarter dates of all securities
+    unique_quarter_dates = {r.quarter_date for r in hist_shares_rows}
+    factor_map = {}
+    for q_date in unique_quarter_dates:
+        # Load the exact factors for this date for all securities
+        exact_rows = session.execute(
+            select(AdjustedPrice.security_id, AdjustedPrice.adjustment_factor)
+            .where(AdjustedPrice.trade_date == q_date)
+        ).all()
+        for r in exact_rows:
+            factor_map[(r.security_id, q_date)] = float(r.adjustment_factor)
+            
+        # For any security missing on this exact date (e.g. weekend/holiday), find closest preceding/succeeding factors in bulk
+        missing_sec_ids = [s.id for s in stocks if (s.id, q_date) not in factor_map]
+        if missing_sec_ids:
+            # 1. Fetch closest preceding factors in bulk
+            subq_prec = (
+                select(
+                    AdjustedPrice.security_id,
+                    func.max(AdjustedPrice.trade_date).label("max_date")
+                )
+                .where(AdjustedPrice.security_id.in_(missing_sec_ids))
+                .where(AdjustedPrice.trade_date <= q_date)
+                .group_by(AdjustedPrice.security_id)
+                .subquery()
+            )
+            prec_factors = session.execute(
+                select(AdjustedPrice.security_id, AdjustedPrice.adjustment_factor)
+                .join(subq_prec, (AdjustedPrice.security_id == subq_prec.c.security_id) & (AdjustedPrice.trade_date == subq_prec.c.max_date))
+            ).all()
+            
+            resolved_sec_ids = set()
+            for r in prec_factors:
+                factor_map[(r.security_id, q_date)] = float(r.adjustment_factor)
+                resolved_sec_ids.add(r.security_id)
+                
+            # 2. For any still missing, fallback to closest succeeding factors in bulk
+            still_missing = [sid for sid in missing_sec_ids if sid not in resolved_sec_ids]
+            if still_missing:
+                subq_succ = (
+                    select(
+                        AdjustedPrice.security_id,
+                        func.min(AdjustedPrice.trade_date).label("min_date")
+                    )
+                    .where(AdjustedPrice.security_id.in_(still_missing))
+                    .where(AdjustedPrice.trade_date >= q_date)
+                    .group_by(AdjustedPrice.security_id)
+                    .subquery()
+                )
+                succ_factors = session.execute(
+                    select(AdjustedPrice.security_id, AdjustedPrice.adjustment_factor)
+                    .join(subq_succ, (AdjustedPrice.security_id == subq_succ.c.security_id) & (AdjustedPrice.trade_date == subq_succ.c.min_date))
+                ).all()
+                
+                resolved_succ = set()
+                for r in succ_factors:
+                    factor_map[(r.security_id, q_date)] = float(r.adjustment_factor)
+                    resolved_succ.add(r.security_id)
+                    
+                # 3. Ultimate fallback: default to 1.0 if absolutely no prices exist yet
+                for sid in still_missing:
+                    if sid not in resolved_succ:
+                        factor_map[(sid, q_date)] = 1.0
+            
+            # Ultimate fallback for any that missed preceding search
+            for sid in missing_sec_ids:
+                if (sid, q_date) not in factor_map:
+                    factor_map[(sid, q_date)] = 1.0
+
+    # 4. For all other stocks, calculate market cap only for the new dates
     query = (
         select(
             RawPrice.security_id,
@@ -207,22 +301,48 @@ async def calculate_incremental_market_caps_for_range(session: Session, start_da
     results = session.execute(query).all()
     records = []
     for row in results:
-        shares = stock_shares_map.get(row.security_id)
-        if not shares:
-            continue
+        sec_id = row.security_id
+        trade_date = row.trade_date
+        raw_close = float(row.close)
         factor = float(row.adjustment_factor) if row.adjustment_factor else 1.0
         if factor <= 0:
             factor = 1.0
-        historical_shares = int(round(shares / factor))
-        raw_close = float(row.close)
-        mcap_value = round(historical_shares * raw_close, 2)
+
+        current_shares = stock_shares_map.get(sec_id)
+        hist_shares = shares_by_sec.get(sec_id, [])
+
+        # Try to resolve shares from closest preceding quarter
+        resolved_shares = None
+        for q_date, shares in reversed(hist_shares):
+            if q_date <= trade_date:
+                q_factor = factor_map.get((sec_id, q_date), 1.0)
+                if q_factor <= 0:
+                    q_factor = 1.0
+                resolved_shares = int(round(shares * (q_factor / factor)))
+                break
+
+        # Fallback 1: earlier than first quarter record
+        if resolved_shares is None and hist_shares:
+            q_date, shares = hist_shares[0]
+            q_factor = factor_map.get((sec_id, q_date), 1.0)
+            if q_factor <= 0:
+                q_factor = 1.0
+            resolved_shares = int(round(shares * (q_factor / factor)))
+
+        # Fallback 2: no quarterly records exist at all
+        if resolved_shares is None:
+            if not current_shares:
+                continue
+            resolved_shares = int(round(current_shares / factor))
+
+        mcap_value = truncate_decimal((resolved_shares * raw_close) / 10_000_000.0, 2)
         records.append({
-            "security_id": row.security_id,
-            "trade_date": row.trade_date,
-            "close_price": raw_close,
-            "issued_shares": historical_shares,
+            "security_id": sec_id,
+            "trade_date": trade_date,
+            "close_price": truncate_decimal(raw_close, 2),
+            "issued_shares": resolved_shares,
             "market_cap": mcap_value,
-            "shares_source": "REVERSE_ENGINEERED"
+            "shares_source": "BSE_QUARTERLY_SHP" if hist_shares else "REVERSE_ENGINEERED"
         })
 
     if records:
@@ -240,4 +360,3 @@ async def calculate_incremental_market_caps_for_range(session: Session, start_da
 
     logger.info(f"Incremental market cap calculation completed. Total records written: {total_written}")
     return total_written
-

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from loguru import logger
 
 from src.models import Security, RawPrice, AdjustedPrice, CorporateAction
-from src.db.repository import bulk_upsert_adjusted_prices
+from src.utils.math_utils import truncate_decimal
 
 
 async def adjust_prices_for_security(session: Session, security_id: int) -> int:
@@ -34,8 +34,18 @@ async def adjust_prices_for_security(session: Session, security_id: int) -> int:
     if not raw_prices:
         return 0
 
-    # 3. Create a list of ex_date and adjustment factor tuples
-    action_factors = [(a.ex_date, float(a.adjustment_factor)) for a in actions]
+    # 3. Create a list of ex_date and adjustment factor tuples (guarding against invalid/non-positive factors)
+    action_factors = []
+    for a in actions:
+        try:
+            factor = float(a.adjustment_factor) if a.adjustment_factor else 1.0
+            if factor <= 0:
+                logger.warning(f"Invalid adjustment factor {factor} for corporate action ID {a.id}. Defaulting to 1.0.")
+                factor = 1.0
+        except Exception as e:
+            logger.warning(f"Failed to parse adjustment factor for corporate action ID {a.id}: {e}. Defaulting to 1.0.")
+            factor = 1.0
+        action_factors.append((a.ex_date, factor))
 
     # 4. Generate adjusted prices
     adjusted_records = []
@@ -49,14 +59,17 @@ async def adjust_prices_for_security(session: Session, security_id: int) -> int:
         for ex_date, factor in action_factors:
             if trade_date < ex_date:
                 cumulative_factor *= factor
+                
+        if cumulative_factor <= 0:
+            cumulative_factor = 1.0
 
         adjusted_records.append({
             "security_id": security_id,
             "trade_date": trade_date,
-            "adj_open": round(float(price.open) / cumulative_factor, 2),
-            "adj_high": round(float(price.high) / cumulative_factor, 2),
-            "adj_low": round(float(price.low) / cumulative_factor, 2),
-            "adj_close": round(float(price.close) / cumulative_factor, 2),
+            "adj_open": truncate_decimal(float(price.open) / cumulative_factor, 2),
+            "adj_high": truncate_decimal(float(price.high) / cumulative_factor, 2),
+            "adj_low": truncate_decimal(float(price.low) / cumulative_factor, 2),
+            "adj_close": truncate_decimal(float(price.close) / cumulative_factor, 2),
             "adj_volume": int(round(float(price.volume) * cumulative_factor)),
             "adjustment_factor": round(cumulative_factor, 6)
         })
@@ -167,13 +180,15 @@ async def adjust_incremental_prices(session: Session, start_date: date, end_date
     adjusted_records = []
     for rp in raw_prices:
         factor = factor_map.get(rp.security_id, 1.0)
+        if factor <= 0:
+            factor = 1.0
         adjusted_records.append({
             "security_id": rp.security_id,
             "trade_date": rp.trade_date,
-            "adj_open": round(float(rp.open) / factor, 2),
-            "adj_high": round(float(rp.high) / factor, 2),
-            "adj_low": round(float(rp.low) / factor, 2),
-            "adj_close": round(float(rp.close) / factor, 2),
+            "adj_open": truncate_decimal(float(rp.open) / factor, 2),
+            "adj_high": truncate_decimal(float(rp.high) / factor, 2),
+            "adj_low": truncate_decimal(float(rp.low) / factor, 2),
+            "adj_close": truncate_decimal(float(rp.close) / factor, 2),
             "adj_volume": int(round(float(rp.volume) * factor)),
             "adjustment_factor": round(factor, 6)
         })

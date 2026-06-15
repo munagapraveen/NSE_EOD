@@ -2,7 +2,6 @@ from datetime import date, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from loguru import logger
-import pandas as pd
 
 from src.models import Security, SymbolChange
 from src.services.nse_client import NSEClient
@@ -28,40 +27,60 @@ def _merge_securities(session: Session, old_sec: Security, new_sec: Security):
     from the old security record into the new security record, then delete the old one.
     """
     from sqlalchemy import delete, update
-    from src.models import RawPrice, AdjustedPrice, Indicator, MarketCap, CorporateAction, SymbolChange
+    from src.models import RawPrice, AdjustedPrice, Indicator, MarketCap, CorporateAction, SymbolChange, HistoricalShare
 
     logger.info(f"Merging price history and metadata from ID {old_sec.id} ({old_sec.symbol}) into ID {new_sec.id} ({new_sec.symbol})...")
 
-    # Fetch all dates that already exist in the target security to prevent duplicate key violations
+    # Identify dates that already exist in the target security
     target_dates = set(session.execute(
         select(RawPrice.trade_date).where(RawPrice.security_id == new_sec.id)
     ).scalars().all())
 
-    # Delete overlapping dates from the old security before updating IDs
-    if target_dates:
-        target_dates_list = list(target_dates)
+    # Helper to count non‑null data columns (exclude id, security_id, trade_date)
+    def _non_null_count(row):
+        return sum(1 for col in row.__table__.columns
+                   if col.name not in {"id", "security_id", "trade_date"}
+                   and getattr(row, col.name) is not None)
+
+    # Reconcile overlapping rows for each price‑related model
+    models = [RawPrice, AdjustedPrice, Indicator, MarketCap]
+    for Model in models:
+        if not target_dates:
+            continue
+        # Load old rows that overlap
+        old_rows = session.execute(
+            select(Model).where(Model.security_id == old_sec.id)
+            .where(Model.trade_date.in_(list(target_dates)))
+        ).scalars().all()
+        for old in old_rows:
+            # Load corresponding new row (there will be exactly one)
+            new = session.execute(
+                select(Model).where(Model.security_id == new_sec.id)
+                .where(Model.trade_date == old.trade_date)
+            ).scalar_one_or_none()
+            if new is None:
+                continue
+            # Keep the row with more non‑null fields
+            if _non_null_count(old) > _non_null_count(new):
+                # Update the new row with values from the old row
+                update_dict = {
+                    col.name: getattr(old, col.name)
+                    for col in Model.__table__.columns
+                    if col.name not in {"id", "security_id", "trade_date"}
+                }
+                session.execute(
+                    update(Model)
+                    .where(Model.id == new.id)
+                    .values(**update_dict)
+                )
+        # After reconciliation, delete the old overlapping rows
         session.execute(
-            delete(RawPrice)
-            .where(RawPrice.security_id == old_sec.id)
-            .where(RawPrice.trade_date.in_(target_dates_list))
-        )
-        session.execute(
-            delete(AdjustedPrice)
-            .where(AdjustedPrice.security_id == old_sec.id)
-            .where(AdjustedPrice.trade_date.in_(target_dates_list))
-        )
-        session.execute(
-            delete(Indicator)
-            .where(Indicator.security_id == old_sec.id)
-            .where(Indicator.trade_date.in_(target_dates_list))
-        )
-        session.execute(
-            delete(MarketCap)
-            .where(MarketCap.security_id == old_sec.id)
-            .where(MarketCap.trade_date.in_(target_dates_list))
+            delete(Model)
+            .where(Model.security_id == old_sec.id)
+            .where(Model.trade_date.in_(list(target_dates)))
         )
 
-    # Update security_id for remaining prices and logs
+    # Update security_id for remaining (non‑overlapping) rows
     session.execute(
         update(RawPrice)
         .where(RawPrice.security_id == old_sec.id)
@@ -82,11 +101,45 @@ def _merge_securities(session: Session, old_sec: Security, new_sec: Security):
         .where(MarketCap.security_id == old_sec.id)
         .values(security_id=new_sec.id)
     )
+
+    # Resolve corporate action overlaps to prevent unique constraint violation on merge
+    existing_cas = session.execute(
+        select(CorporateAction.ex_date, CorporateAction.action_type)
+        .where(CorporateAction.security_id == new_sec.id)
+    ).all()
+    if existing_cas:
+        for ex_date, action_type in existing_cas:
+            session.execute(
+                delete(CorporateAction)
+                .where(CorporateAction.security_id == old_sec.id)
+                .where(CorporateAction.ex_date == ex_date)
+                .where(CorporateAction.action_type == action_type)
+            )
+
     session.execute(
         update(CorporateAction)
         .where(CorporateAction.security_id == old_sec.id)
         .values(security_id=new_sec.id)
     )
+
+    # Resolve historical shares overlaps to prevent unique constraint violation on merge
+    existing_shares = session.execute(
+        select(HistoricalShare.quarter_date)
+        .where(HistoricalShare.security_id == new_sec.id)
+    ).scalars().all()
+    if existing_shares:
+        session.execute(
+            delete(HistoricalShare)
+            .where(HistoricalShare.security_id == old_sec.id)
+            .where(HistoricalShare.quarter_date.in_(existing_shares))
+        )
+
+    session.execute(
+        update(HistoricalShare)
+        .where(HistoricalShare.security_id == old_sec.id)
+        .values(security_id=new_sec.id)
+    )
+
     session.execute(
         update(SymbolChange)
         .where(SymbolChange.security_id == old_sec.id)

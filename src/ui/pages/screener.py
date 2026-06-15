@@ -1,10 +1,11 @@
+import asyncio
 from datetime import date
 import pandas as pd
 from nicegui import ui
 
 from src.db.engine import SessionLocal
-from src.services.screener import run_sharpe_screener, export_screener_to_excel, get_closest_trading_date
-from src.models import RawPrice
+from src.services.screener import run_sharpe_screener, export_screener_to_excel
+from loguru import logger
 from sqlalchemy import func
 
 # Global storage for results so that we can export them
@@ -156,8 +157,9 @@ def render():
             
             session = SessionLocal()
             try:
-                # 1. Execute Sharpe Screener calculation
-                df_all = run_sharpe_screener(
+                # 1. Execute Sharpe Screener calculation on worker thread
+                df_all = await asyncio.to_thread(
+                    run_sharpe_screener,
                     session=session,
                     target_date=t_date,
                     long_months=long_val,
@@ -180,7 +182,11 @@ def render():
                     (df_filtered["total_circuit_hits_3m"] <= 10)
                 ].reset_index(drop=True)
                 
-                # Cache results for Excel export
+                # Convert NaN values to None to ensure valid JSON serialization for AG Grid
+                df_all_sanitized = df_all.where(pd.notnull(df_all), None)
+                df_filtered_sanitized = df_filtered.where(pd.notnull(df_filtered), None)
+
+                # Cache results for Excel export (keep original DataFrames for Excel writing)
                 current_results["df_all"] = df_all
                 current_results["df_filtered"] = df_filtered
                 current_results["target_date"] = t_date
@@ -209,7 +215,7 @@ def render():
                                     
                             grid_all = ui.aggrid({
                                 "columnDefs": columns,
-                                "rowData": df_all.to_dict(orient="records"),
+                                "rowData": df_all_sanitized.to_dict(orient="records"),
                                 "rowSelection": "single",
                                 "theme": "balham-dark",
                                 "pagination": True,
@@ -238,7 +244,7 @@ def render():
                                         
                                 grid_filt = ui.aggrid({
                                     "columnDefs": columns,
-                                    "rowData": df_filtered.to_dict(orient="records"),
+                                    "rowData": df_filtered_sanitized.to_dict(orient="records"),
                                     "rowSelection": "single",
                                     "theme": "balham-dark",
                                     "pagination": True,

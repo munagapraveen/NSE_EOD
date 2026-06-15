@@ -11,7 +11,7 @@ class CorporateAction(Base):
     )
 
     id = Column(Integer, Sequence("corporate_actions_id_seq"), primary_key=True)
-    security_id = Column(Integer, nullable=False, index=True)
+    security_id = Column(Integer, ForeignKey("securities.id"), nullable=False, index=True)
     action_type = Column(String(20), nullable=False)  # SPLIT or BONUS
     ex_date = Column(Date, nullable=False, index=True)
     record_date = Column(Date, nullable=True)

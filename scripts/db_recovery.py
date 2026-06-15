@@ -1,7 +1,6 @@
 import os
 import sys
 import shutil
-import tempfile
 import duckdb
 from datetime import datetime
 from loguru import logger

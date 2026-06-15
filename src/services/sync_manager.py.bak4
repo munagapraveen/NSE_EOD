@@ -6,7 +6,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from loguru import logger
 
-from src.models import Security, RawPrice, SyncLog
+from src.models import Security, RawPrice, AdjustedPrice, Indicator, SyncLog
 from src.services.nse_client import NSEClient
 from src.services.stock_downloader import StockDownloader
 from src.services.etf_downloader import ETFDownloader
@@ -31,6 +31,31 @@ class SyncManager:
         self.ca_service = CorporateActionsService(client)
         self.sc_service = SymbolChangesService(client)
         self._cancel_requested = False
+
+    def _detect_post_processing_gaps(self, session: Session) -> dict:
+        """Detect raw prices missing adjusted prices or indicators from previous failed runs."""
+        from sqlalchemy import func as sqlfunc, distinct
+
+        # Count distinct (security_id, trade_date) pairs in each table
+        raw_count = session.query(
+            sqlfunc.count(distinct(sqlfunc.concat(RawPrice.security_id, '-', RawPrice.trade_date)))
+        ).scalar() or 0
+
+        adj_count = session.query(
+            sqlfunc.count(distinct(sqlfunc.concat(AdjustedPrice.security_id, '-', AdjustedPrice.trade_date)))
+        ).scalar() or 0
+
+        ind_count = session.query(
+            sqlfunc.count(distinct(sqlfunc.concat(Indicator.security_id, '-', Indicator.trade_date)))
+        ).scalar() or 0
+
+        return {
+            "raw_count": raw_count,
+            "adj_count": adj_count,
+            "ind_count": ind_count,
+            "has_adj_gap": raw_count > adj_count,
+            "has_ind_gap": adj_count > ind_count,
+        }
 
     def request_cancel(self):
         """Request cancellation of the current sync run."""
@@ -81,14 +106,27 @@ class SyncManager:
         etf_symbols = await self.etf_downloader.get_all_etf_symbols(session)
 
         # Log start of sync log
-        sync_log = SyncLog(
-            sync_type="FULL_SYNC" if len(options) > 3 else "PARTIAL_SYNC",
-            sync_date=end_date,
-            status="STARTED",
-            started_at=datetime.now()
-        )
-        session.add(sync_log)
-        session.commit()
+        sync_type = "FULL_SYNC" if len(options) > 3 else "PARTIAL_SYNC"
+        existing_log = session.query(SyncLog).filter_by(
+            sync_type=sync_type,
+            sync_date=end_date
+        ).first()
+
+        if existing_log:
+            sync_log = existing_log
+            sync_log.status = "STARTED"
+            sync_log.started_at = datetime.now()
+            sync_log.completed_at = None
+            sync_log.error_message = None
+            sync_log.records_processed = 0
+        else:
+            sync_log = SyncLog(
+                sync_type=sync_type,
+                sync_date=end_date,
+                status="STARTED",
+                started_at=datetime.now()
+            )
+            session.add(sync_log)
 
         total_prices_imported = 0
         
@@ -108,6 +146,7 @@ class SyncManager:
             if progress_callback:
                 progress_callback("BHAVCOPY", percent, f"Syncing Daily Data for {disp_date}...")
 
+
             # A. Download Daily Bhavcopy once
             has_bhavcopy = False
             bhavcopy_df = None
@@ -119,11 +158,13 @@ class SyncManager:
                     has_bhavcopy = True
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
-                        logger.info(f"Bhavcopy 404 for {current_date.isoformat()} (Weekend/Holiday). Skipping.")
+                        logger.warning(f"Bhavcopy 404 for {current_date.isoformat()} (Weekend/Holiday/Delayed). Skipping.")
                     else:
                         logger.error(f"HTTP error downloading bhavcopy for {current_date.isoformat()}: {e}")
+                        raise e
                 except Exception as e:
                     logger.error(f"Error downloading bhavcopy for {current_date.isoformat()}: {e}")
+                    raise e
 
             # B. Ingest regular stocks from bhavcopy
             if options.get("stocks") and has_bhavcopy:
@@ -133,6 +174,7 @@ class SyncManager:
                     total_prices_imported += imported
                 except Exception as e:
                     logger.error(f"Failed to import stocks on {current_date.isoformat()}: {e}")
+                    raise e
 
             # C. Ingest ETFs from bhavcopy
             if options.get("etfs") and has_bhavcopy:
@@ -142,6 +184,7 @@ class SyncManager:
                     total_prices_imported += imported
                 except Exception as e:
                     logger.error(f"Failed to import ETFs on {current_date.isoformat()}: {e}")
+                    raise e
 
             # D. Ingest Indexes
             if options.get("indexes"):
@@ -149,8 +192,8 @@ class SyncManager:
                     imported = await self.index_downloader.download_and_import_date(session, current_date)
                     total_prices_imported += imported
                 except Exception as e:
-                    # Logs already written in service
-                    pass
+                    # Let the exception propagate to abort the sync if it is a real failure (like today's 404)
+                    raise e
 
         # 3. MASTER DATA ENRICHMENT (Stocks)
         if self._cancel_requested: return self._cancel_summary()
@@ -167,11 +210,14 @@ class SyncManager:
                 enriched_count = 0
                 delisted_count = 0
                 
+                # Dynamically resolve ISIN column (NSE changed from 'ISIN NO' to 'ISIN NUMBER')
+                isin_col = "ISIN NUMBER" if "ISIN NUMBER" in df_equity.columns else "ISIN NO"
+                
                 # Match and update profiles
                 for _, row in df_equity.iterrows():
                     sym = str(row["SYMBOL"]).strip()
                     name = str(row["NAME OF COMPANY"]).strip()
-                    isin = str(row["ISIN NO"]).strip()
+                    isin = str(row[isin_col]).strip()
                     series = str(row["SERIES"]).strip()
                     
                     sec = isin_map.get(isin) or stock_map.get(sym)
@@ -184,7 +230,7 @@ class SyncManager:
                         enriched_count += 1
                         
                 # Mark stocks NOT in EQUITY_L as delisted
-                master_isins = set(df_equity["ISIN NO"].astype(str).str.strip())
+                master_isins = set(df_equity[isin_col].astype(str).str.strip())
                 for s in stocks:
                     if s.isin and s.isin not in master_isins:
                         s.is_active = False
@@ -222,6 +268,7 @@ class SyncManager:
             
             if missing_shares_stocks:
                 logger.info(f"Fetching issued shares count for {len(missing_shares_stocks)} stocks...")
+                consecutive_failures = 0
                 for idx, stock in enumerate(missing_shares_stocks):
                     if self._cancel_requested: return self._cancel_summary()
                     
@@ -231,7 +278,7 @@ class SyncManager:
                         progress_callback("SHARES_OUTSTANDING", sub_pct, f"Fetching shares for {stock.symbol} ({idx+1}/{len(missing_shares_stocks)})...")
                     
                     try:
-                        quote = await self.client.fetch_stock_quote(stock.symbol)
+                        quote = await self.client.fetch_stock_quote(stock.symbol, retries=0)
                         # Extract issuedSize from quote (structure: quote['marketDeptOrderBook']['tradeInfo']['issuedCap'] or similar)
                         # Safe extract:
                         trade_info = quote.get("marketDeptOrderBook", {}).get("tradeInfo", {})
@@ -241,10 +288,34 @@ class SyncManager:
                             stock.issued_shares = int(float(issued_cap))
                             session.commit()
                             logger.info(f"Updated shares outstanding for {stock.symbol}: {stock.issued_shares}")
+                        consecutive_failures = 0  # Reset counter on success
                     except Exception as e:
                         logger.warning(f"Failed to fetch quote for {stock.symbol}: {e}")
+                        consecutive_failures += 1
+                        
+                        if consecutive_failures >= 5:
+                            logger.error("Too many consecutive quote fetch failures (likely rate-limited/blocked by NSE). Aborting shares outstanding fetch stage.")
+                            break
                         # Keep going to prevent locking
                         await asyncio.sleep(1.0)
+
+        # Determine if database already has price history and if the date range is small
+        has_history = session.query(RawPrice).first() is not None
+        is_incremental = has_history and (end_date - start_date).days <= 10
+        logger.info(f"Sync type detection: has_history={has_history}, range_days={(end_date - start_date).days}, is_incremental={is_incremental}")
+
+        # Detect gaps from previous failed runs and force global recalculation if needed
+        if is_incremental:
+            gaps = self._detect_post_processing_gaps(session)
+            if gaps["has_adj_gap"] or gaps["has_ind_gap"]:
+                logger.warning(
+                    f"Detected post-processing gaps from a previous run! "
+                    f"Raw={gaps['raw_count']}, Adj={gaps['adj_count']}, Ind={gaps['ind_count']}. "
+                    f"Forcing global recalculation to fill gaps..."
+                )
+                is_incremental = False
+            else:
+                logger.info(f"No post-processing gaps detected (Raw={gaps['raw_count']}, Adj={gaps['adj_count']}, Ind={gaps['ind_count']})")
 
         # 6. SYNC CORPORATE ACTIONS
         if self._cancel_requested: return self._cancel_summary()
@@ -254,13 +325,26 @@ class SyncManager:
             try:
                 # Sync actions from start_date to end_date
                 await self.ca_service.sync_corporate_actions(session, start_date, end_date)
+                
+                # If this is an incremental sync, adjust outstanding shares for new corporate actions on their ex-date
+                if is_incremental:
+                    from src.models import CorporateAction
+                    unprocessed_actions = session.query(CorporateAction).filter(
+                        CorporateAction.action_type.in_(["SPLIT", "BONUS"]),
+                        CorporateAction.ex_date <= end_date,
+                        CorporateAction.is_processed == False
+                    ).all()
+                    
+                    for action in unprocessed_actions:
+                        sec = session.get(Security, action.security_id)
+                        if sec and sec.issued_shares is not None:
+                            old_shares = sec.issued_shares
+                            new_shares = int(round(old_shares * float(action.adjustment_factor)))
+                            logger.info(f"Adjusting issued_shares for {sec.symbol} due to {action.action_type} (ex-date: {action.ex_date}): {old_shares} -> {new_shares}")
+                            sec.issued_shares = new_shares
+                    session.commit()
             except Exception as e:
                 logger.error(f"Failed to sync corporate actions: {e}")
-
-        # Determine if database already has price history and if the date range is small
-        has_history = session.query(RawPrice).first() is not None
-        is_incremental = has_history and (end_date - start_date).days <= 10
-        logger.info(f"Sync type detection: has_history={has_history}, range_days={(end_date - start_date).days}, is_incremental={is_incremental}")
 
         # 7. PRICE ADJUSTMENT
         if self._cancel_requested: return self._cancel_summary()
@@ -315,6 +399,11 @@ class SyncManager:
         sync_log.records_processed = total_prices_imported
         sync_log.completed_at = datetime.now()
         session.commit()
+
+        # Close session and dispose engine to release Windows file locks before backup
+        session.close()
+        from src.db.engine import engine as _engine
+        _engine.dispose()
 
         # Create database backup after successful sync
         try:

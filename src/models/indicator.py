@@ -10,7 +10,7 @@ class Indicator(Base):
     )
 
     id = Column(Integer, Sequence("indicators_id_seq"), primary_key=True)
-    security_id = Column(Integer, nullable=False, index=True)
+    security_id = Column(Integer, ForeignKey("securities.id"), nullable=False, index=True)
     trade_date = Column(Date, nullable=False, index=True)
 
     # Simple Moving Averages
