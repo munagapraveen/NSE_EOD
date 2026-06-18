@@ -86,10 +86,8 @@ class IndexDownloader:
                 logger.error(f"Index file missing column: {required_col}. Columns: {list(df.columns)}")
                 raise ValueError(f"Index file missing required column: {required_col}")
 
-        # Filter for tracked indexes only
-        from config.constants import TRACKED_INDEXES
-        tracked_set = {name.upper() for name in TRACKED_INDEXES}
-        df_clean = df[df[name_col].str.strip().str.upper().isin(tracked_set)].copy()
+        # Process all indexes dynamically
+        df_clean = df.copy()
 
         # Create index mapping for all unique index names in the file
         names_found = set(df_clean[name_col].str.strip())

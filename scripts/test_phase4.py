@@ -7,7 +7,7 @@ from datetime import date, timedelta
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.db.engine import SessionLocal
-from src.models import Security, RawPrice, AdjustedPrice, CorporateAction, MarketCap, Indicator
+from src.models import Security, RawPrice, AdjustedPrice, CorporateAction, MarketCap, Indicator, HistoricalShare, SymbolChange
 from src.services.price_adjuster import adjust_prices_for_security
 from src.services.market_cap import calculate_historical_market_cap, calculate_all_historical_market_caps
 from src.services.indicators import calculate_indicators_for_security, calculate_all_indicators
@@ -19,11 +19,19 @@ async def run_tests():
     
     try:
         # Clean previous test entries
+        from sqlalchemy import text
         test_symbols = ["TESTSTOCK", "TESTETF", "TESTINDEX"]
         for sym in test_symbols:
             existing = session.query(Security).filter(Security.symbol == sym).first()
             if existing:
-                session.delete(existing)
+                session.execute(text("DELETE FROM indicators WHERE security_id = :sid"), {"sid": existing.id})
+                session.execute(text("DELETE FROM market_cap WHERE security_id = :sid"), {"sid": existing.id})
+                session.execute(text("DELETE FROM corporate_actions WHERE security_id = :sid"), {"sid": existing.id})
+                session.execute(text("DELETE FROM adjusted_prices WHERE security_id = :sid"), {"sid": existing.id})
+                session.execute(text("DELETE FROM raw_prices WHERE security_id = :sid"), {"sid": existing.id})
+                session.execute(text("DELETE FROM historical_shares WHERE security_id = :sid"), {"sid": existing.id})
+                session.execute(text("DELETE FROM symbol_changes WHERE security_id = :sid"), {"sid": existing.id})
+                session.execute(text("DELETE FROM securities WHERE id = :sid"), {"sid": existing.id})
         session.commit()
 
         # =====================================================================
@@ -116,14 +124,14 @@ async def run_tests():
         # Pre-split: shares outstanding should be 10M / 2.0 = 5M
         for row in mcap_pre_split:
             assert row.issued_shares == 5000000
-            expected_mcap = round(5000000 * float(row.close_price), 2)
+            expected_mcap = round((5000000 * float(row.close_price)) / 10000000.0, 2)
             assert float(row.market_cap) == expected_mcap
             assert row.shares_source == "REVERSE_ENGINEERED"
 
         # Post-split: shares outstanding should be 10M / 1.0 = 10M
         for row in mcap_post_split:
             assert row.issued_shares == 10000000
-            expected_mcap = round(10000000 * float(row.close_price), 2)
+            expected_mcap = round((10000000 * float(row.close_price)) / 10000000.0, 2)
             assert float(row.market_cap) == expected_mcap
             assert row.shares_source == "REVERSE_ENGINEERED"
 
