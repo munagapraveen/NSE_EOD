@@ -50,9 +50,15 @@ async def sync_historical_shares_for_security(
     tasks = [fetch_one(qid) for qid in qtrids]
     results = await asyncio.gather(*tasks)
     
+    seen_dates = set()
     records_added = 0
     for qid, shares, qtr_date, err in results:
         if shares and qtr_date:
+            if qtr_date in seen_dates:
+                logger.debug(f"Skipping duplicate quarter date {qtr_date} from qtrid {qid} for security ID {security_id}.")
+                continue
+            seen_dates.add(qtr_date)
+            
             # Check if record already exists for this security and quarter
             stmt = select(HistoricalShare).where(
                 HistoricalShare.security_id == security_id,

@@ -1,5 +1,6 @@
 *.xlsx
 *.pyc
+*.bak*
 *.db
 *.db-shm
 *.db-wal
@@ -10,7 +11,14 @@
 /data
 /reports
 Todo.txt
-/scripts
-/scripts
 /scratch
-/deploy
+
+# Environments & config
+.env
+.env.cloud
+.venv/
+
+# Python cache & tooling
+__pycache__/
+.pytest_cache/
+.ruff_cache/

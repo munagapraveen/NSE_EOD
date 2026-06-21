@@ -96,13 +96,15 @@ class SyncManager:
         """
         sync_completed_ok = False
         try:
-            summary = await self._run_sync_internal_impl(
-                session=session,
-                start_date=start_date,
-                end_date=end_date,
-                options=options,
-                progress_callback=progress_callback
-            )
+            from src.services.symbol_changes import temporary_index_drop
+            with temporary_index_drop(session):
+                summary = await self._run_sync_internal_impl(
+                    session=session,
+                    start_date=start_date,
+                    end_date=end_date,
+                    options=options,
+                    progress_callback=progress_callback
+                )
             if summary.get("status") in ("SUCCESS", "PARTIAL"):
                 sync_completed_ok = True
             return summary

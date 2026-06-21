@@ -1,0 +1,35 @@
+[Unit]
+Description=NSE EOD Data Manager (NiceGUI Web App)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/app/nse_eod
+
+# Use the virtual environment's Python
+ExecStart=/app/nse_eod/.venv/bin/python -m src.main
+
+# Restart policy — auto-restart on crash, wait 10s between retries
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=120
+StartLimitBurst=5
+
+# Environment
+EnvironmentFile=/app/nse_eod/.env
+
+# Logging — journal captures stdout/stderr
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nse-eod
+
+# Resource limits (optional, good practice)
+# Limit RAM to 4 GB (adjust based on your A1 allocation)
+MemoryMax=4G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

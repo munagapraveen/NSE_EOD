@@ -1,10 +1,60 @@
 from datetime import date, datetime
-from sqlalchemy import select
+from contextlib import contextmanager
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 from loguru import logger
 
 from src.models import Security, SymbolChange
 from src.services.nse_client import NSEClient
+
+
+@contextmanager
+def temporary_index_drop(session: Session):
+    """
+    Temporarily drop the unique indexes on securities before updating symbols,
+    then recreate them afterwards. This works around a known DuckDB bug where
+    updating indexed columns on a table with active foreign keys causes
+    spurious constraint check failures.
+    """
+    def index_exists(name):
+        res = session.execute(
+            text(f"SELECT COUNT(*) FROM pg_indexes WHERE indexname = '{name}'")
+        ).scalar()
+        return res > 0
+
+    dropped_symbol = False
+    dropped_isin = False
+    
+    try:
+        if index_exists("ix_securities_symbol"):
+            session.execute(text("DROP INDEX ix_securities_symbol"))
+            dropped_symbol = True
+        if index_exists("ix_securities_isin"):
+            session.execute(text("DROP INDEX ix_securities_isin"))
+            dropped_isin = True
+            
+        if dropped_symbol or dropped_isin:
+            session.commit()
+            
+        yield
+    except Exception as e:
+        logger.warning(f"Error occurred during temporary index drop context: {e}. Rolling back transaction.")
+        try:
+            session.rollback()
+        except Exception as rollback_err:
+            logger.warning(f"Rollback failed: {rollback_err}")
+        raise
+    finally:
+        recreate_needed = False
+        if dropped_symbol and not index_exists("ix_securities_symbol"):
+            session.execute(text("CREATE UNIQUE INDEX ix_securities_symbol ON securities(symbol)"))
+            recreate_needed = True
+        if dropped_isin and not index_exists("ix_securities_isin"):
+            session.execute(text("CREATE UNIQUE INDEX ix_securities_isin ON securities(isin)"))
+            recreate_needed = True
+            
+        if recreate_needed:
+            session.commit()
 
 
 def parse_change_date(date_str: str) -> date:
@@ -198,73 +248,74 @@ class SymbolChangesService:
         new_recorded_count = 0
         applied_count = 0
 
-        for _, row in df.iterrows():
-            comp_name = str(row.get("company_name", "")).strip()
-            old_sym = str(row.get("old_symbol", "")).strip()
-            new_sym = str(row.get("new_symbol", "")).strip()
-            eff_date_str = str(row.get("effective_date", "")).strip()
+        with temporary_index_drop(session):
+            for _, row in df.iterrows():
+                comp_name = str(row.get("company_name", "")).strip()
+                old_sym = str(row.get("old_symbol", "")).strip()
+                new_sym = str(row.get("new_symbol", "")).strip()
+                eff_date_str = str(row.get("effective_date", "")).strip()
 
-            if not old_sym or not new_sym:
-                continue
+                if not old_sym or not new_sym:
+                    continue
 
-            eff_date = parse_change_date(eff_date_str)
+                eff_date = parse_change_date(eff_date_str)
 
-            # Check if this change record is already in symbol_changes table
-            existing_change = session.execute(
-                select(SymbolChange)
-                .where(SymbolChange.old_symbol == old_sym)
-                .where(SymbolChange.new_symbol == new_sym)
-            ).scalar_one_or_none()
-
-            change_rec = existing_change
-            if not change_rec:
-                change_rec = SymbolChange(
-                    security_id=None,
-                    old_symbol=old_sym,
-                    new_symbol=new_sym,
-                    effective_date=eff_date,
-                    is_applied=False
-                )
-                session.add(change_rec)
-                session.flush()  # get ID
-                new_recorded_count += 1
-
-            # If not applied yet, try to apply it
-            if not change_rec.is_applied:
-                # 1. Look up if we have the old security in our database
-                old_sec = session.execute(
-                    select(Security).where(Security.symbol == old_sym)
+                # Check if this change record is already in symbol_changes table
+                existing_change = session.execute(
+                    select(SymbolChange)
+                    .where(SymbolChange.old_symbol == old_sym)
+                    .where(SymbolChange.new_symbol == new_sym)
                 ).scalar_one_or_none()
 
-                if old_sec:
-                    # 2. Check if a security with the new symbol already exists
-                    # (to prevent unique constraint conflict on symbol)
-                    new_sec_exists = session.execute(
-                        select(Security).where(Security.symbol == new_sym)
+                change_rec = existing_change
+                if not change_rec:
+                    change_rec = SymbolChange(
+                        security_id=None,
+                        old_symbol=old_sym,
+                        new_symbol=new_sym,
+                        effective_date=eff_date,
+                        is_applied=False
+                    )
+                    session.add(change_rec)
+                    session.flush()  # get ID
+                    new_recorded_count += 1
+
+                # If not applied yet, try to apply it
+                if not change_rec.is_applied:
+                    # 1. Look up if we have the old security in our database
+                    old_sec = session.execute(
+                        select(Security).where(Security.symbol == old_sym)
                     ).scalar_one_or_none()
 
-                    if new_sec_exists:
-                        _merge_securities(session, old_sec, new_sec_exists)
-                        change_rec.security_id = new_sec_exists.id
-                        change_rec.is_applied = True
-                        change_rec.applied_at = datetime.now()
-                        applied_count += 1
-                    else:
-                        logger.info(f"Applying symbol change: {old_sym} -> {new_sym} (Security ID: {old_sec.id})")
-                        old_sec.symbol = new_sym
-                        if comp_name and not old_sec.company_name:
-                            old_sec.company_name = comp_name
-                        
-                        change_rec.security_id = old_sec.id
-                        change_rec.is_applied = True
-                        change_rec.applied_at = datetime.now()
-                        applied_count += 1
+                    if old_sec:
+                        # 2. Check if a security with the new symbol already exists
+                        # (to prevent unique constraint conflict on symbol)
+                        new_sec_exists = session.execute(
+                            select(Security).where(Security.symbol == new_sym)
+                        ).scalar_one_or_none()
 
-        if new_recorded_count > 0 or applied_count > 0:
-            session.commit()
-            logger.info(f"Recorded {new_recorded_count} new symbol changes; applied {applied_count} changes.")
-        else:
-            logger.info("No new symbol changes found or applied.")
+                        if new_sec_exists:
+                            _merge_securities(session, old_sec, new_sec_exists)
+                            change_rec.security_id = new_sec_exists.id
+                            change_rec.is_applied = True
+                            change_rec.applied_at = datetime.now()
+                            applied_count += 1
+                        else:
+                            logger.info(f"Applying symbol change: {old_sym} -> {new_sym} (Security ID: {old_sec.id})")
+                            old_sec.symbol = new_sym
+                            if comp_name and not old_sec.company_name:
+                                old_sec.company_name = comp_name
+                            
+                            change_rec.security_id = old_sec.id
+                            change_rec.is_applied = True
+                            change_rec.applied_at = datetime.now()
+                            applied_count += 1
+
+            if new_recorded_count > 0 or applied_count > 0:
+                session.commit()
+                logger.info(f"Recorded {new_recorded_count} new symbol changes; applied {applied_count} changes.")
+            else:
+                logger.info("No new symbol changes found or applied.")
 
         return new_recorded_count
 
@@ -281,32 +332,33 @@ class SymbolChangesService:
             return 0
 
         applied_count = 0
-        for change in pending_changes:
-            old_sec = session.execute(
-                select(Security).where(Security.symbol == change.old_symbol)
-            ).scalar_one_or_none()
-
-            if old_sec:
-                new_sec_exists = session.execute(
-                    select(Security).where(Security.symbol == change.new_symbol)
+        with temporary_index_drop(session):
+            for change in pending_changes:
+                old_sec = session.execute(
+                    select(Security).where(Security.symbol == change.old_symbol)
                 ).scalar_one_or_none()
 
-                if new_sec_exists:
-                    _merge_securities(session, old_sec, new_sec_exists)
-                    change.security_id = new_sec_exists.id
-                    change.is_applied = True
-                    change.applied_at = datetime.now()
-                    applied_count += 1
-                else:
-                    logger.info(f"Applying pending symbol change: {change.old_symbol} -> {change.new_symbol} (ID: {old_sec.id})")
-                    old_sec.symbol = change.new_symbol
-                    change.security_id = old_sec.id
-                    change.is_applied = True
-                    change.applied_at = datetime.now()
-                    applied_count += 1
+                if old_sec:
+                    new_sec_exists = session.execute(
+                        select(Security).where(Security.symbol == change.new_symbol)
+                    ).scalar_one_or_none()
 
-        if applied_count > 0:
-            session.commit()
-            logger.info(f"Applied {applied_count} pending symbol changes.")
+                    if new_sec_exists:
+                        _merge_securities(session, old_sec, new_sec_exists)
+                        change.security_id = new_sec_exists.id
+                        change.is_applied = True
+                        change.applied_at = datetime.now()
+                        applied_count += 1
+                    else:
+                        logger.info(f"Applying pending symbol change: {change.old_symbol} -> {change.new_symbol} (ID: {old_sec.id})")
+                        old_sec.symbol = change.new_symbol
+                        change.security_id = old_sec.id
+                        change.is_applied = True
+                        change.applied_at = datetime.now()
+                        applied_count += 1
+
+            if applied_count > 0:
+                session.commit()
+                logger.info(f"Applied {applied_count} pending symbol changes.")
 
         return applied_count
