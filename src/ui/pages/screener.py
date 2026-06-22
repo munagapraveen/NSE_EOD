@@ -1,5 +1,6 @@
 import asyncio
 from datetime import date
+from pathlib import Path
 import pandas as pd
 from nicegui import ui
 
@@ -276,7 +277,7 @@ def render():
                 return
                 
             try:
-                # Export results to Excel
+                # Export results to Excel (saves to reports/ on server)
                 file_path = export_screener_to_excel(
                     df_all=current_results["df_all"],
                     df_filtered=current_results["df_filtered"],
@@ -285,9 +286,18 @@ def render():
                     short_months=current_results["short_months"]
                 )
                 
-                # Notify the user of successful save location
-                ui.notify(f"Workbook saved to: {file_path}", type="positive")
-                status_label.set_text(f"Report exported successfully! Saved to: {file_path}")
+                # Read file bytes into memory then immediately delete from disk
+                p = Path(file_path)
+                file_bytes = p.read_bytes()
+                p.unlink()
+                logger.info(f"Deleted server-side copy after reading into memory: {file_path}")
+                
+                # Trigger browser download from in-memory bytes (no file left on server)
+                ui.download(file_bytes, filename=p.name)
+                
+                # Notify the user of successful download trigger
+                ui.notify("Excel export completed! Download started.", type="positive")
+                status_label.set_text("Report exported successfully! Download initiated.")
             except Exception as e:
                 logger.error(f"Excel export failed: {e}")
                 ui.notify(f"Excel export failed: {e}", type="negative")
