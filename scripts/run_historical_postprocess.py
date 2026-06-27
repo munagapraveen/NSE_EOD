@@ -83,130 +83,40 @@ async def main():
         except Exception as e:
             print(f"Warning: Failed to sync symbol changes: {e}")
             
-        # 5. Fetch Outstanding Shares for active stocks that don't have them using BSEClient in concurrent batches
-        print("\n--- Phase 3: Fetching Outstanding Shares from BSE (Concurrent) ---")
-        from src.services.bse_client import BSEClient
-        bse_client = BSEClient()
+        # 5. Fetch Outstanding Shares & Historical Quarterly Shares via NSE XBRL
+        print("\n--- Phase 3: Fetching Outstanding Shares from NSE XBRL (Bulk) ---")
+        from src.services.historical_shares import sync_all_historical_shares
         try:
-            missing_shares_stocks = session.query(Security).filter(
+            print(f"Syncing all NSE shareholding filings from {min_date.strftime('%Y-%m-%d')} to today...")
+            total_saved = await sync_all_historical_shares(session, min_date, client)
+            print(f"Saved {total_saved} quarterly share records via NSE XBRL.")
+
+            # Refresh Security.issued_shares from latest historical record
+            from src.models import HistoricalShare
+            from sqlalchemy import select
+            stocks_to_refresh = session.query(Security).filter(
                 Security.security_type == 'STOCK',
                 Security.is_active == True,
                 Security.is_delisted == False,
-                Security.issued_shares == None
             ).all()
-            
-            print(f"Found {len(missing_shares_stocks)} active stocks with missing issued_shares.")
-            if missing_shares_stocks:
-                async def fetch_one(stock):
-                    if not stock.isin:
-                        return stock, None, None, "No ISIN"
-                    try:
-                        scrip_code = await bse_client.lookup_scripcode_by_isin(stock.isin)
-                        if not scrip_code:
-                            return stock, None, None, "Could not resolve BSE scripcode"
-                        issued, qtr_date = await bse_client.fetch_outstanding_shares(scrip_code)
-                        if issued and issued > 0:
-                            return stock, issued, qtr_date, None
-                        else:
-                            return stock, None, None, "No shares parsed"
-                    except Exception as err:
-                        return stock, None, None, str(err)
-
-                CHUNK_SIZE = 15
-                for idx in range(0, len(missing_shares_stocks), CHUNK_SIZE):
-                    chunk = missing_shares_stocks[idx:idx+CHUNK_SIZE]
-                    print(f"[{idx+1}-{min(idx+CHUNK_SIZE, len(missing_shares_stocks))}/{len(missing_shares_stocks)}] Fetching batch...", end="", flush=True)
-                    
-                    tasks = [fetch_one(s) for s in chunk]
-                    results = await asyncio.gather(*tasks)
-                    
-                    success_batch_count = 0
-                    fail_messages = []
-                    for stock, issued, qtr_date, error in results:
-                        if issued:
-                            stock.issued_shares = issued
-                            success_batch_count += 1
-                            if qtr_date:
-                                from src.models import HistoricalShare
-                                from sqlalchemy import select
-                                stmt = select(HistoricalShare).where(
-                                    HistoricalShare.security_id == stock.id,
-                                    HistoricalShare.quarter_date == qtr_date
-                                )
-                                existing = session.execute(stmt).scalar()
-                                if existing:
-                                    existing.issued_shares = issued
-                                else:
-                                    new_share = HistoricalShare(
-                                        security_id=stock.id,
-                                        quarter_date=qtr_date,
-                                        issued_shares=issued,
-                                        source="BSE_QUARTERLY_SHP"
-                                    )
-                                    session.add(new_share)
-                        else:
-                            fail_messages.append(f"{stock.symbol}: {error}")
-                    
-                    session.commit()
-                    print(f" Success: {success_batch_count}/{len(chunk)}")
-                    if fail_messages:
-                        print(f"   Failures: {', '.join(fail_messages[:5])}" + (f" and {len(fail_messages)-5} more" if len(fail_messages) > 5 else ""))
-                    await asyncio.sleep(0.5)
-
-                # Retry all failed shares once more
-                failed_stocks = [s for s in missing_shares_stocks if s.issued_shares is None]
-                if failed_stocks:
-                    print(f"\n--- Retrying {len(failed_stocks)} failed OS shares downloads once more ---")
-                    for idx in range(0, len(failed_stocks), CHUNK_SIZE):
-                        chunk = failed_stocks[idx:idx+CHUNK_SIZE]
-                        print(f"[RETRY {idx+1}-{min(idx+CHUNK_SIZE, len(failed_stocks))}/{len(failed_stocks)}] Fetching batch...", end="", flush=True)
-                        
-                        tasks = [fetch_one(s) for s in chunk]
-                        results = await asyncio.gather(*tasks)
-                        
-                        success_batch_count = 0
-                        fail_messages = []
-                        for stock, issued, qtr_date, error in results:
-                            if issued:
-                                stock.issued_shares = issued
-                                success_batch_count += 1
-                                if qtr_date:
-                                    from src.models import HistoricalShare
-                                    from sqlalchemy import select
-                                    stmt = select(HistoricalShare).where(
-                                        HistoricalShare.security_id == stock.id,
-                                        HistoricalShare.quarter_date == qtr_date
-                                    )
-                                    existing = session.execute(stmt).scalar()
-                                    if existing:
-                                        existing.issued_shares = issued
-                                    else:
-                                        new_share = HistoricalShare(
-                                            security_id=stock.id,
-                                            quarter_date=qtr_date,
-                                            issued_shares=issued,
-                                            source="BSE_QUARTERLY_SHP"
-                                        )
-                                        session.add(new_share)
-                            else:
-                                fail_messages.append(f"{stock.symbol}: {error}")
-                        
-                        session.commit()
-                        print(f" Success: {success_batch_count}/{len(chunk)}")
-                        if fail_messages:
-                            print(f"   Failures: {', '.join(fail_messages[:5])}" + (f" and {len(fail_messages)-5} more" if len(fail_messages) > 5 else ""))
-                        await asyncio.sleep(0.5)
-        finally:
-            await bse_client.close()
-
-        # 5.5 Fetch Historical Quarterly Shares for active stocks
-        print("\n--- Phase 3.5: Fetching Historical Outstanding Shares from BSE ---")
-        from src.services.historical_shares import sync_all_historical_shares
-        try:
-            print(f"Syncing historical shares starting from: {min_date.strftime('%Y-%m-%d')}...")
-            await sync_all_historical_shares(session, min_date)
+            updated = 0
+            for stock in stocks_to_refresh:
+                latest = session.execute(
+                    select(HistoricalShare)
+                    .where(HistoricalShare.security_id == stock.id)
+                    .order_by(HistoricalShare.quarter_date.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if latest and latest.issued_shares:
+                    stock.issued_shares = latest.issued_shares
+                    updated += 1
+            session.commit()
+            print(f"Refreshed Security.issued_shares for {updated} stocks.")
         except Exception as e:
-            print(f"Warning: Failed to sync historical outstanding shares: {e}")
+            print(f"Warning: Failed to sync outstanding shares from NSE XBRL: {e}")
+            import traceback
+            traceback.print_exc()
+
                 
         # 6. Run Price Adjustment
         print("\n--- Phase 4: Running Global Price Adjustments (Splits/Bonuses) ---")

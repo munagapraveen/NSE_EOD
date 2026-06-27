@@ -1,196 +1,238 @@
+"""
+test_shares_retry.py — Updated for NSE XBRL-based outstanding shares.
+
+Tests that:
+1. sync_historical_shares_for_security correctly upserts XBRL data and updates Security.issued_shares
+2. _fetch_shares_for_all_stocks correctly bulk-fetches and updates all stocks
+3. Stocks with no XBRL filings remain NULL (graceful failure)
+"""
+
 import asyncio
 import sys
 import os
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from unittest.mock import patch, MagicMock
+from datetime import date
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 # Append project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models import Base, Security
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from src.models import Base, Security, HistoricalShare
 from src.services.sync_manager import SyncManager
 from src.services.nse_client import NSEClient
 
-
-# 1. Mock BSE Client implementation
-class MockBSEClient:
-    def __init__(self):
-        self.call_counts = {}
-
-    async def lookup_scripcode_by_isin(self, isin: str):
-        if isin == "INE_SUCCESS":
-            return "500123"
-        elif isin == "INE_RETRY":
-            return "500456"
-        elif isin == "INE_FAIL":
-            return "500789"
-        return None
-
-    async def fetch_outstanding_shares(self, scrip_code: str):
-        self.call_counts[scrip_code] = self.call_counts.get(scrip_code, 0) + 1
-        
-        # Stock A: Success on first attempt
-        if scrip_code == "500123":
-            return 1000000, None
-            
-        # Stock B: Fails on first attempt, succeeds on retry (second attempt)
-        elif scrip_code == "500456":
-            if self.call_counts[scrip_code] == 1:
-                return None, None
-            else:
-                return 2500000, None
-                
-        # Stock C: Fails on all attempts
-        elif scrip_code == "500789":
-            return None, None
-            
-        return None, None
-
-    async def close(self):
-        pass
+pytestmark = pytest.mark.asyncio
 
 
-async def run_tests():
-    print("--- Starting Outstanding Shares Retry Tests ---")
-    
-    # 2. Setup clean in-memory database
-    print("\nSetting up in-memory DuckDB...")
-    engine = create_engine("duckdb:///:memory:", echo=False)
+# ──────────────────────────────────────────────────────────────────────────────
+#  Minimal stub XBRL XML builder
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _make_xbrl(shares: int, quarter_date: str, ctx: str = "ShareholdingPattern_ContextI") -> bytes:
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<xbrl xmlns="http://www.xbrl.org/2003/instance">
+  <DateOfReport>{quarter_date}</DateOfReport>
+  <NumberOfFullyPaidUpEquityShares contextRef="{ctx}">{shares}</NumberOfFullyPaidUpEquityShares>
+</xbrl>'''.encode()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Test setup helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _setup_db():
+    engine = create_engine("sqlite:///:memory:", echo=False)
     Base.metadata.create_all(bind=engine)
     Session = sessionmaker(bind=engine)
-    session = Session()
+    return Session()
 
-    # 3. Seed test securities
-    print("Seeding test securities...")
-    stock_success = Security(
-        symbol="SUCC", company_name="Success Stock", security_type="STOCK",
-        is_active=True, is_delisted=False, isin="INE_SUCCESS", issued_shares=None
-    )
-    stock_retry = Security(
-        symbol="RETR", company_name="Retry Stock", security_type="STOCK",
-        is_active=True, is_delisted=False, isin="INE_RETRY", issued_shares=None
-    )
-    stock_fail = Security(
-        symbol="FAIL", company_name="Fail Stock", security_type="STOCK",
-        is_active=True, is_delisted=False, isin="INE_FAIL", issued_shares=None
-    )
-    session.add_all([stock_success, stock_retry, stock_fail])
-    session.commit()
 
-    # Mock NSEClient for SyncManager instantiation
+def _make_sync_manager():
     nse_client = MagicMock(spec=NSEClient)
-    sync_manager = SyncManager(nse_client)
+    return SyncManager(nse_client), nse_client
 
-    # 4. Patch BSEClient and run SyncManager retry test
-    print("\n--- Test 1: Testing SyncManager Retry Logic ---")
-    mock_bse = MockBSEClient()
-    
-    with patch("src.services.bse_client.BSEClient", return_value=mock_bse):
-        await sync_manager._fetch_shares_for_all_stocks(session)
-            
-    # Refresh objects from DB
-    session.expire_all()
-    s_success = session.query(Security).filter_by(symbol="SUCC").one()
-    s_retry = session.query(Security).filter_by(symbol="RETR").one()
-    s_fail = session.query(Security).filter_by(symbol="FAIL").one()
 
-    print(f"SUCC shares: {s_success.issued_shares}")
-    print(f"RETR shares: {s_retry.issued_shares}")
-    print(f"FAIL shares: {s_fail.issued_shares}")
+# ──────────────────────────────────────────────────────────────────────────────
+#  Test 1: sync_historical_shares_for_security — happy path
+# ──────────────────────────────────────────────────────────────────────────────
 
-    assert s_success.issued_shares == 1000000, "SUCC should succeed on first try"
-    assert s_retry.issued_shares == 2500000, "RETR should succeed on retry attempt"
-    assert s_fail.issued_shares is None, "FAIL should remain NULL"
-    print("[PASS] SyncManager retry logic verified successfully!")
+async def test_sync_one_stock_success():
+    print("\n--- Test 1: sync_historical_shares_for_security (success) ---")
+    from src.services.historical_shares import sync_historical_shares_for_security
 
-    # 5. Reset values for postprocess script test
-    print("\n--- Test 2: Testing Post-Processing Script Phase 3 Retry Logic ---")
-    s_success.issued_shares = None
-    s_retry.issued_shares = None
-    s_fail.issued_shares = None
+    session = _setup_db()
+    sec = Security(
+        symbol="RELIANCE", company_name="Reliance", security_type="STOCK",
+        is_active=True, is_delisted=False, issued_shares=None
+    )
+    session.add(sec)
     session.commit()
-    
-    # Simulate run_historical_postprocess.py's Phase 3 with mocked client
-    mock_bse2 = MockBSEClient()
-    
-    # We execute the Phase 3 retry code block directly on our test database using the mock
-    import src.services.bse_client
-    
-    with patch("src.services.bse_client.BSEClient", return_value=mock_bse2):
-        bse_client = src.services.bse_client.BSEClient()
-        try:
-            missing_shares_stocks = session.query(Security).filter(
-                Security.security_type == 'STOCK',
-                Security.is_active == True,
-                Security.is_delisted == False,
-                Security.issued_shares == None
-            ).all()
-            
-            print(f"Found {len(missing_shares_stocks)} active stocks with missing issued_shares in test.")
-            assert len(missing_shares_stocks) == 3
-            
-            async def fetch_one(stock):
-                if not stock.isin:
-                    return stock, None, "No ISIN"
-                try:
-                    scrip_code = await bse_client.lookup_scripcode_by_isin(stock.isin)
-                    if not scrip_code:
-                        return stock, None, "Could not resolve BSE scripcode"
-                    issued, qtr_date = await bse_client.fetch_outstanding_shares(scrip_code)
-                    if issued and issued > 0:
-                        return stock, issued, None
-                    else:
-                        return stock, None, "No shares parsed"
-                except Exception as err:
-                    return stock, None, str(err)
 
-            CHUNK_SIZE = 2
-            # First Loop
-            for idx in range(0, len(missing_shares_stocks), CHUNK_SIZE):
-                chunk = missing_shares_stocks[idx:idx+CHUNK_SIZE]
-                tasks = [fetch_one(s) for s in chunk]
-                results = await asyncio.gather(*tasks)
-                for stock, issued, error in results:
-                    print(f"  First pass result for {stock.symbol}: issued={issued}, error={error}")
-                    if issued:
-                        stock.issued_shares = issued
-                session.commit()
+    xbrl_bytes = _make_xbrl(1_500_000_000, "2025-03-31")
 
-            # Retry Loop
-            failed_stocks = [s for s in missing_shares_stocks if s.issued_shares is None]
-            print(f"Failed stocks after first pass: {[s.symbol for s in failed_stocks]}")
-            assert len(failed_stocks) == 2  # RETR and FAIL should have failed on first pass
-            
-            if failed_stocks:
-                for idx in range(0, len(failed_stocks), CHUNK_SIZE):
-                    chunk = failed_stocks[idx:idx+CHUNK_SIZE]
-                    tasks = [fetch_one(s) for s in chunk]
-                    results = await asyncio.gather(*tasks)
-                    for stock, issued, error in results:
-                        if issued:
-                            stock.issued_shares = issued
-                    session.commit()
-        finally:
-            await bse_client.close()
+    # Mock: fetch_shareholding_filings returns 1 filing; _download_xbrl returns our stub
+    mock_filings = [{
+        "symbol": "RELIANCE",
+        "xbrl_url": "https://nsearchives.nseindia.com/fake/reliance.xml",
+        "report_date": date(2025, 3, 31),
+        "record_id": "1234",
+    }]
 
-    # Refresh objects from DB
+    with patch("src.services.historical_shares.fetch_shareholding_filings", return_value=mock_filings), \
+         patch("src.services.historical_shares._download_xbrl", return_value=xbrl_bytes):
+        nse_client = MagicMock(spec=NSEClient)
+        saved = await sync_historical_shares_for_security(
+            session, sec.id, "RELIANCE", date(2024, 1, 1), nse_client
+        )
+
+    assert saved == 1, f"Expected 1 record saved, got {saved}"
+
     session.expire_all()
-    s_success = session.query(Security).filter_by(symbol="SUCC").one()
-    s_retry = session.query(Security).filter_by(symbol="RETR").one()
-    s_fail = session.query(Security).filter_by(symbol="FAIL").one()
+    record = session.query(HistoricalShare).filter_by(security_id=sec.id).first()
+    assert record is not None, "HistoricalShare record not created"
+    assert record.issued_shares == 1_500_000_000
+    assert record.quarter_date == date(2025, 3, 31)
+    assert record.source == "NSE_XBRL_SHP"
 
-    print(f"SUCC shares: {s_success.issued_shares}")
-    print(f"RETR shares: {s_retry.issued_shares}")
-    print(f"FAIL shares: {s_fail.issued_shares}")
+    print(f"  [PASS] Saved 1 XBRL record: {record.issued_shares:,} shares @ {record.quarter_date}")
+    session.close()
 
-    assert s_success.issued_shares == 1000000, "SUCC should succeed on first try in postprocess"
-    assert s_retry.issued_shares == 2500000, "RETR should succeed on retry attempt in postprocess"
-    assert s_fail.issued_shares is None, "FAIL should remain NULL in postprocess"
-    print("[PASS] Post-processing script retry logic verified successfully!")
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Test 2: sync_historical_shares_for_security — no filings (graceful null)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def test_sync_one_stock_no_filings():
+    print("\n--- Test 2: sync_historical_shares_for_security (no filings -> NULL stays) ---")
+    from src.services.historical_shares import sync_historical_shares_for_security
+
+    session = _setup_db()
+    sec = Security(
+        symbol="NEWSTOCK", company_name="New Stock", security_type="STOCK",
+        is_active=True, is_delisted=False, issued_shares=None
+    )
+    session.add(sec)
+    session.commit()
+
+    with patch("src.services.historical_shares.fetch_shareholding_filings", return_value=[]):
+        nse_client = MagicMock(spec=NSEClient)
+        saved = await sync_historical_shares_for_security(
+            session, sec.id, "NEWSTOCK", date(2024, 1, 1), nse_client
+        )
+
+    assert saved == 0, f"Expected 0 records saved, got {saved}"
+    session.expire_all()
+    assert sec.issued_shares is None, "issued_shares should remain NULL"
+    print("  [PASS] No filings -> issued_shares stays NULL (graceful)")
+    session.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Test 3: sync_all_historical_shares — bulk fetch, multiple stocks
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def test_bulk_fetch_all_stocks():
+    print("\n--- Test 3: sync_all_historical_shares (bulk fetch, 3 stocks) ---")
+    from src.services.historical_shares import sync_all_historical_shares
+
+    session = _setup_db()
+    stocks = []
+    for sym, shares in [("INFY", 420_000_000), ("TCS", 370_000_000), ("WIPRO", 530_000_000)]:
+        sec = Security(
+            symbol=sym, company_name=sym, security_type="STOCK",
+            is_active=True, is_delisted=False, issued_shares=None
+        )
+        session.add(sec)
+        stocks.append((sym, shares))
+    session.commit()
+
+    mock_filings = [
+        {"symbol": sym, "xbrl_url": f"https://fake/{sym}.xml", "report_date": date(2025, 3, 31), "record_id": str(i)}
+        for i, (sym, _) in enumerate(stocks)
+    ]
+
+    def _fake_xbrl(sym):
+        sh = dict(stocks)[sym]
+        return _make_xbrl(sh, "2025-03-31")
+
+    async def _mock_download(url, nse_client):
+        sym = url.split("/")[-1].replace(".xml", "")
+        return _fake_xbrl(sym)
+
+    with patch("src.services.historical_shares.fetch_shareholding_filings", return_value=mock_filings), \
+         patch("src.services.historical_shares._download_xbrl", side_effect=_mock_download):
+        nse_client = MagicMock(spec=NSEClient)
+        total_saved = await sync_all_historical_shares(
+            session, date(2024, 1, 1), nse_client
+        )
+
+    assert total_saved == 3, f"Expected 3 records, got {total_saved}"
+
+    for sym, expected_shares in stocks:
+        rec = session.query(HistoricalShare).join(Security).filter(Security.symbol == sym).first()
+        assert rec is not None, f"No HistoricalShare for {sym}"
+        assert rec.issued_shares == expected_shares, f"{sym}: expected {expected_shares}, got {rec.issued_shares}"
+        assert rec.source == "NSE_XBRL_SHP"
+        print(f"  [PASS] {sym}: {rec.issued_shares:,} shares @ {rec.quarter_date}")
 
     session.close()
-    print("\nAll retry tests passed successfully!")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Test 4: _fetch_shares_for_all_stocks via SyncManager
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def test_sync_manager_fetch_all_stocks():
+    print("\n--- Test 4: SyncManager._fetch_shares_for_all_stocks (NSE XBRL bulk) ---")
+
+    session = _setup_db()
+    for sym, shares in [("HDFC", 760_000_000), ("AXIS", 310_000_000)]:
+        sec = Security(
+            symbol=sym, company_name=sym, security_type="STOCK",
+            is_active=True, is_delisted=False, issued_shares=None
+        )
+        session.add(sec)
+    session.commit()
+
+    mock_filings = [
+        {"symbol": "HDFC", "xbrl_url": "https://fake/HDFC.xml", "report_date": date(2025, 3, 31), "record_id": "1"},
+        {"symbol": "AXIS", "xbrl_url": "https://fake/AXIS.xml", "report_date": date(2025, 3, 31), "record_id": "2"},
+    ]
+    xbrl_map = {"HDFC": _make_xbrl(760_000_000, "2025-03-31"), "AXIS": _make_xbrl(310_000_000, "2025-03-31")}
+
+    async def _mock_download(url, nse_client):
+        sym = url.split("/")[-1].replace(".xml", "")
+        return xbrl_map[sym]
+
+    sync_manager, _ = _make_sync_manager()
+    with patch("src.services.historical_shares.fetch_shareholding_filings", return_value=mock_filings), \
+         patch("src.services.historical_shares._download_xbrl", side_effect=_mock_download):
+        await sync_manager._fetch_shares_for_all_stocks(session, force_refresh=True)
+
+    session.expire_all()
+    for sym, expected_shares in [("HDFC", 760_000_000), ("AXIS", 310_000_000)]:
+        sec = session.query(Security).filter_by(symbol=sym).one()
+        assert sec.issued_shares == expected_shares, f"{sym}: expected {expected_shares}, got {sec.issued_shares}"
+        print(f"  [PASS] {sym}.issued_shares = {sec.issued_shares:,}")
+
+    session.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Runner
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def run_tests():
+    print("=== NSE XBRL Outstanding Shares Tests ===")
+    await test_sync_one_stock_success()
+    await test_sync_one_stock_no_filings()
+    await test_bulk_fetch_all_stocks()
+    await test_sync_manager_fetch_all_stocks()
+    print("\n=== All tests passed! ===")
 
 
 if __name__ == "__main__":

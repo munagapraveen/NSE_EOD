@@ -20,13 +20,27 @@ def get_dashboard_stats():
         last_log = session.query(SyncLog).filter(SyncLog.status == 'SUCCESS').order_by(SyncLog.completed_at.desc()).first()
         last_sync = last_log.completed_at.strftime("%d-%b-%Y %H:%M") if last_log else "Never"
         
-        # Database size
-        db_path = "data/market.db"
+        # Database size & type
         db_url = settings.database_url
-        if db_url.startswith("duckdb:///"):
-            db_path = db_url.replace("duckdb:///", "")
-            
-        db_size_mb = os.path.getsize(db_path) / (1024 * 1024) if os.path.exists(db_path) else 0.0
+        db_type = "Local DB"
+        size_bytes = 0
+        
+        if db_url.startswith("postgresql://") or db_url.startswith("postgresql+"):
+            db_type = "PostgreSQL"
+            from sqlalchemy import text
+            try:
+                size_bytes = session.execute(text("SELECT pg_database_size(current_database())")).scalar() or 0
+            except Exception as pg_err:
+                from loguru import logger
+                logger.warning(f"Failed to query PostgreSQL database size: {pg_err}")
+        else:
+            db_path = "data/market.db"
+            if db_url.startswith("duckdb:///"):
+                db_path = db_url.replace("duckdb:///", "")
+            if os.path.exists(db_path):
+                size_bytes = os.path.getsize(db_path)
+                
+        db_size_mb = size_bytes / (1024 * 1024)
         db_size = f"{db_size_mb:.2f} MB"
         
         return {
@@ -34,10 +48,13 @@ def get_dashboard_stats():
             "etfs": total_etfs,
             "indexes": total_indexes,
             "last_sync": last_sync,
-            "db_size": db_size
+            "db_size": db_size,
+            "db_type": db_type
         }
-    except Exception:
-        return {"stocks": 0, "etfs": 0, "indexes": 0, "last_sync": "Error", "db_size": "0.00 MB"}
+    except Exception as e:
+        from loguru import logger
+        logger.error(f"Dashboard stats error: {e}")
+        return {"stocks": 0, "etfs": 0, "indexes": 0, "last_sync": "Error", "db_size": "0.00 MB", "db_type": "Unknown"}
     finally:
         session.close()
 
@@ -142,7 +159,7 @@ def render():
             with ui.card().classes("stat-card w-full"):
                 ui.label("DATABASE SIZE").classes("text-xs text-slate-400 font-bold tracking-wider")
                 ui.label(stats["db_size"]).classes("text-4xl font-extrabold text-white mt-1")
-                ui.label("DuckDB Storage active").classes("text-xs text-indigo-400 mt-2")
+                ui.label(f"{stats.get('db_type', 'Local DB')} Storage active").classes("text-xs text-indigo-400 mt-2")
                 
             # Last Sync Date Card
             with ui.card().classes("stat-card w-full"):
@@ -167,7 +184,7 @@ def render():
                     grid = ui.aggrid({
                         "columnDefs": columns,
                         "rowData": gainers,
-                        "theme": "balham-dark",
+                        "theme": "balham",
                         "defaultColDef": {"sortable": True, "resizable": True}
                     }).classes("w-full h-[220px]")
                     grid.on("cellDoubleClicked", lambda e: ui.navigate.to(f"/stocks/{e.args['data']['symbol']}"))
@@ -189,7 +206,7 @@ def render():
                     grid = ui.aggrid({
                         "columnDefs": columns,
                         "rowData": losers,
-                        "theme": "balham-dark",
+                        "theme": "balham",
                         "defaultColDef": {"sortable": True, "resizable": True}
                     }).classes("w-full h-[220px]")
                     grid.on("cellDoubleClicked", lambda e: ui.navigate.to(f"/stocks/{e.args['data']['symbol']}"))
@@ -215,7 +232,7 @@ def render():
                 ui.aggrid({
                     "columnDefs": activity_cols,
                     "rowData": activities,
-                    "theme": "balham-dark",
+                    "theme": "balham",
                     "defaultColDef": {"sortable": True, "resizable": True}
                 }).classes("w-full h-[250px]")
             else:

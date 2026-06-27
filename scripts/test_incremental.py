@@ -193,25 +193,25 @@ async def test_incremental_processing():
         .where(MarketCap.trade_date == date(2026, 6, 4))
     ).scalar_one()
     print(f"TCS Market Cap on 2026-06-04: {tcs_mcap.market_cap} (shares: {tcs_mcap.issued_shares})")
-    assert tcs_mcap.market_cap == 4000000000.00, "TCS Market Cap is incorrect!"
+    assert tcs_mcap.market_cap == 400.00, "TCS Market Cap is incorrect!"
 
-    # INFY market cap on 2026-06-04 (post split): shares = 1,000,000, close = 1000.0, mcap = 1,000,000,000.00
+    # INFY market cap on 2026-06-04 (post split): shares = 1,000,000, close = 1000.0, mcap = 1,000,000,000.00 / 10,000,000 = 100.00 Crores
     infy_mcap_post = session.execute(
         select(MarketCap)
         .where(MarketCap.security_id == infy.id)
         .where(MarketCap.trade_date == date(2026, 6, 4))
     ).scalar_one()
     print(f"INFY Post-Split Market Cap on 2026-06-04: {infy_mcap_post.market_cap} (shares: {infy_mcap_post.issued_shares})")
-    assert infy_mcap_post.market_cap == 1000000000.00, "INFY Post-Split Market Cap is incorrect!"
+    assert infy_mcap_post.market_cap == 100.00, "INFY Post-Split Market Cap is incorrect!"
 
-    # INFY market cap on 2026-05-29 (pre split): shares = 1,000,000 / 2 = 500,000, close = 1000.0, mcap = 500,000,000.00
+    # INFY market cap on 2026-05-29 (pre split): shares = 1,000,000 / 2 = 500,000, close = 1000.0, mcap = 500,000,000.00 / 10,000,000 = 50.00 Crores
     infy_mcap_pre = session.execute(
         select(MarketCap)
         .where(MarketCap.security_id == infy.id)
         .where(MarketCap.trade_date == date(2026, 5, 29))
     ).scalar_one()
     print(f"INFY Pre-Split Market Cap on 2026-05-29: {infy_mcap_pre.market_cap} (shares: {infy_mcap_pre.issued_shares})")
-    assert infy_mcap_pre.market_cap == 500000000.00, "INFY Pre-Split Market Cap is incorrect!"
+    assert infy_mcap_pre.market_cap == 50.00, "INFY Pre-Split Market Cap is incorrect!"
 
     # Indicator checks
     # TCS SMA 5 on 2026-06-05 should be 2000.0 (since all history is 2000)

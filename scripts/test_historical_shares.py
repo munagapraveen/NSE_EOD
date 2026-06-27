@@ -4,7 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from src.models import Base, Security, RawPrice, AdjustedPrice, HistoricalShare, MarketCap
-from src.services.bse_client import _parse_quarter_date
+from src.services.historical_shares import parse_xbrl_shares
 from src.services.market_cap import calculate_historical_market_cap, calculate_incremental_market_caps_for_range
 
 class TestHistoricalShares(unittest.TestCase):
@@ -18,19 +18,32 @@ class TestHistoricalShares(unittest.TestCase):
     def tearDown(self):
         self.session.close()
 
-    def test_quarter_date_parsing(self):
-        """Verify that various BSE quarter ending formats are correctly parsed to date objects."""
+    def test_xbrl_share_parsing(self):
+        """Verify that NSE XBRL XML is correctly parsed to extract share counts and report dates."""
+        # Minimal XBRL with both context variants
+        xbrl_template = '''<?xml version="1.0" encoding="UTF-8"?>
+<xbrl xmlns="http://www.xbrl.org/2003/instance">
+  <DateOfReport>{date}</DateOfReport>
+  <NumberOfFullyPaidUpEquityShares contextRef="{ctx}">{shares}</NumberOfFullyPaidUpEquityShares>
+</xbrl>'''
+
         test_cases = [
-            ("Quarter ending :March 2026", date(2026, 3, 31)),
-            ("Quarter ending :June 2025", date(2025, 6, 30)),
-            ("Quarter ended September 30, 2025", date(2025, 9, 30)),
-            ("Quarter ended December 31, 2024", date(2024, 12, 31)),
-            ("Quarter ending :Dec 2024", date(2024, 12, 31)),
-            ("Quarter ending :Mar 2025", date(2025, 3, 31)),
-            ("Invalid text", None),
+            # (context, date_str, shares_str, expected_date, expected_shares)
+            ("ShareholdingPattern_ContextI", "2026-03-31", "1234567890", date(2026, 3, 31), 1234567890),
+            ("ShareholdingPatternI",         "2025-09-30", "987654321",  date(2025, 9, 30), 987654321),
+            # Wrong context → shares not extracted
+            ("WrongContext",                 "2025-06-30", "111111111",  date(2025, 6, 30), None),
         ]
-        for text, expected in test_cases:
-            self.assertEqual(_parse_quarter_date(text), expected, f"Failed on: {text}")
+        for ctx, date_str, shares_str, exp_date, exp_shares in test_cases:
+            xml = xbrl_template.format(ctx=ctx, date=date_str, shares=shares_str).encode()
+            shares, qdate = parse_xbrl_shares(xml)
+            self.assertEqual(qdate, exp_date, f"Date mismatch for context={ctx}")
+            self.assertEqual(shares, exp_shares, f"Shares mismatch for context={ctx}")
+
+        # Malformed XML → returns (None, None) without raising
+        bad_shares, bad_date = parse_xbrl_shares(b"<not valid xml")
+        self.assertIsNone(bad_shares)
+        self.assertIsNone(bad_date)
 
 
 
@@ -117,7 +130,7 @@ class TestHistoricalShares(unittest.TestCase):
         self.assertEqual(rec_post.trade_date, date(2025, 11, 14))
         self.assertEqual(rec_post.issued_shares, 200000000)
         self.assertEqual(float(rec_post.market_cap), 10000.0)
-        self.assertEqual(rec_post.shares_source, "BSE_QUARTERLY_SHP")
+        self.assertEqual(rec_post.shares_source, "NSE_XBRL_SHP")
 
         # Now test incremental calculations
         # Add new date: 2025-11-18

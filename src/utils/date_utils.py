@@ -73,7 +73,9 @@ async def get_nse_holidays(client: NSEClient, cache_path: str = "data/holidays.j
                     
         if parsed_holiday_strs:
             # Cache to file
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            dirname = os.path.dirname(cache_path)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
             with open(cache_path, "w") as f:
                 json.dump(parsed_holiday_strs, f)
             logger.info(f"Successfully cached {len(holidays)} holidays to {cache_path}")

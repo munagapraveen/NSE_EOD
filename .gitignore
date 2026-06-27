@@ -14,8 +14,6 @@ Todo.txt
 /scratch
 
 # Environments & config
-.env
-.env.cloud
 .venv/
 
 # Python cache & tooling

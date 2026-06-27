@@ -82,7 +82,7 @@ def render():
             db_input = ui.input(label="Database URL", value=settings.database_url) \
                 .props("outlined dark") \
                 .classes("w-full")
-            ui.label("Default DuckDB path: 'duckdb:///data/market.db'. Change to a postgresql:// URL for cloud migration.").classes("text-xs text-slate-500 -mt-4")
+            ui.label("Database Connection String (URL). Use a postgresql:// URL for cloud database storage.").classes("text-xs text-slate-500 -mt-4")
 
             ui.label("Ingestion & Rate Limit Parameters").classes("text-lg font-bold text-white mb-2 mt-4")
             
@@ -126,11 +126,11 @@ def render():
             save_btn.on("click", handle_save)
 
         # Database Backups & Index Repair Card
-        with ui.card().classes("glass-card w-full gap-4 max-w-3xl mt-6"):
+        db_file = get_db_file_path()
+        with ui.card().classes("glass-card w-full gap-4 max-w-3xl mt-6" + (" hidden" if not db_file else "")):
             ui.label("Database Backups & Index Repair").classes("text-lg font-bold text-white mb-1")
             ui.label("Backup, restore, and rebuild the database file if you encounter constraint errors or index corruption.").classes("text-xs text-slate-400 -mt-3")
             
-            db_file = get_db_file_path()
             db_size_str = "Unknown"
             if db_file and os.path.exists(db_file):
                 size_bytes = os.path.getsize(db_file)

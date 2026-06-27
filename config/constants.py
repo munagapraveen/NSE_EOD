@@ -54,6 +54,13 @@ STOCK_QUOTE_URL = (
     "https://www.nseindia.com/api/quote-equity"
 )
 
+# NextApi GetQuoteApi — richer payload per symbol
+# Returns issuedSize, totalMarketCap, ffmc, faceValue, sector, industryInfo, indexList
+# Query params: functionName=getSymbolData, marketType=N, series=EQ, symbol=SYMBOL
+GET_QUOTE_API_URL = (
+    "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+)
+
 # Historical index data (alternative to daily CSV)
 INDEX_HISTORY_URL = (
     "https://www.nseindia.com/api/historical/indicesHistory"
@@ -149,4 +156,10 @@ TRACKED_INDEXES = [
     "NIFTY PSU BANK",
     "NIFTY PRIVATE BANK",
 ]
+
+
+# ============================================================
+# Financial Constants
+# ============================================================
+CRORE = 10_000_000.0
 

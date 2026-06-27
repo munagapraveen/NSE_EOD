@@ -54,6 +54,9 @@ class ETFDownloader:
             elif "underlying" in col_lower or "index" in col_lower:
                 underlying_col = col
 
+        if not symbol_col:
+            raise ValueError("ETF master list missing 'symbol' column")
+
         # Seeding
         processed_count = 0
         for _, row in df.iterrows():

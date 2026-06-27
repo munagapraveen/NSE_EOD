@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.db.engine import SessionLocal, engine
 from src.services.nse_client import NSEClient
 from src.services.sync_manager import SyncManager
-from src.models import RawPrice, Base
+from src.models import RawPrice, Base, Security
 from loguru import logger
 
 async def main():
@@ -31,64 +31,52 @@ async def main():
     session = SessionLocal()
     
     try:
-        # Get last updated date for stocks/ETFs and indexes (self-healing)
-        from src.models import Security
-        
-        # Find dates with Stocks/ETFs but no Indexes
-        gap_stock = session.query(RawPrice.trade_date).distinct()\
+        # 1. Fetch all distinct trading dates for active Stocks/ETFs
+        stock_dates_rows = session.query(RawPrice.trade_date).distinct()\
             .join(Security, Security.id == RawPrice.security_id)\
             .filter(Security.security_type.in_(["STOCK", "ETF"]))\
             .filter(Security.is_active == True)\
             .filter(~Security.symbol.like("TEST%"))\
             .filter(~Security.symbol.like("MOCK%"))\
-            .filter(~RawPrice.trade_date.in_(
-                session.query(RawPrice.trade_date)
-                .join(Security, Security.id == RawPrice.security_id)
-                .filter(Security.security_type == "INDEX")
-            ))\
-            .order_by(RawPrice.trade_date)\
-            .first()
-            
-        # Find dates with Indexes but no Stocks/ETFs
-        gap_index = session.query(RawPrice.trade_date).distinct()\
+            .all()
+        stock_dates = {r[0] for r in stock_dates_rows if r[0] is not None}
+        
+        # 2. Fetch all distinct trading dates for active Indexes
+        index_dates_rows = session.query(RawPrice.trade_date).distinct()\
             .join(Security, Security.id == RawPrice.security_id)\
             .filter(Security.security_type == "INDEX")\
             .filter(Security.is_active == True)\
             .filter(~Security.symbol.like("TEST%"))\
             .filter(~Security.symbol.like("MOCK%"))\
-            .filter(~RawPrice.trade_date.in_(
-                session.query(RawPrice.trade_date)
-                .join(Security, Security.id == RawPrice.security_id)
-                .filter(Security.security_type.in_(["STOCK", "ETF"]))
-            ))\
-            .order_by(RawPrice.trade_date)\
-            .first()
-            
+            .all()
+        index_dates = {r[0] for r in index_dates_rows if r[0] is not None}
+        
+        # Find dates with Stocks/ETFs but no Indexes
+        gap_stock_dates = stock_dates - index_dates
+        # Find dates with Indexes but no Stocks/ETFs
+        gap_index_dates = index_dates - stock_dates
+        
         first_gap = None
-        if gap_stock and gap_index:
-            first_gap = min(gap_stock[0], gap_index[0])
-        elif gap_stock:
-            first_gap = gap_stock[0]
-        elif gap_index:
-            first_gap = gap_index[0]
+        if gap_stock_dates and gap_index_dates:
+            first_gap = min(min(gap_stock_dates), min(gap_index_dates))
+        elif gap_stock_dates:
+            first_gap = min(gap_stock_dates)
+        elif gap_index_dates:
+            first_gap = min(gap_index_dates)
             
         if first_gap:
             max_date = first_gap - timedelta(days=1)
             print(f"Detected incomplete daily sync (gap date: {first_gap}). Resuming sync from gap date to backfill...")
         else:
-            # 2. If no gaps, return the max date
-            max_stock = session.query(func.max(RawPrice.trade_date))\
-                .join(Security, Security.id == RawPrice.security_id)\
-                .filter(Security.security_type.in_(["STOCK", "ETF"]))\
-                .scalar()
-            max_index = session.query(func.max(RawPrice.trade_date))\
-                .join(Security, Security.id == RawPrice.security_id)\
-                .filter(Security.security_type == "INDEX")\
-                .scalar()
-            if max_stock and max_index:
-                max_date = min(max_stock, max_index)
+            # If no gaps, return the max date
+            if stock_dates and index_dates:
+                max_date = min(max(stock_dates), max(index_dates))
+            elif stock_dates:
+                max_date = max(stock_dates)
+            elif index_dates:
+                max_date = max(index_dates)
             else:
-                max_date = max_stock or max_index
+                max_date = None
 
         if max_date:
             start_date = max_date + timedelta(days=1)
@@ -133,8 +121,7 @@ async def main():
         import traceback
         traceback.print_exc()
     finally:
-        if session.is_active:
-            session.close()
+        session.close()
         await client.close()
 
 if __name__ == "__main__":

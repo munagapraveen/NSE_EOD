@@ -45,7 +45,7 @@ def create_stock_table(stocks_data: list[dict]):
             "columnDefs": columns,
             "rowData": stocks_data,
             "rowSelection": "single",
-            "theme": "balham-dark",
+            "theme": "balham",
             "pagination": True,
             "paginationPageSize": 15,
             "defaultColDef": {

@@ -12,6 +12,7 @@ from openpyxl.utils import get_column_letter
 
 from src.models import Security, RawPrice, AdjustedPrice, MarketCap
 from src.utils.math_utils import truncate_decimal
+from config.constants import CRORE
 
 
 def get_closest_trading_date(session: Session, target_date: date) -> date:
@@ -116,8 +117,9 @@ def run_sharpe_screener(
     trading_dates = sorted(list(session.execute(dates_query).scalars().all()))
     
     if len(trading_dates) < 252:
-        logger.warning(f"Insufficient trading history in database. Need at least 252 days, found {len(trading_dates)}.")
-        return pd.DataFrame()
+        msg = f"Insufficient trading history in database. Need at least 252 days, found {len(trading_dates)}."
+        logger.error(msg)
+        raise ValueError(msg)
         
     start_history_date = trading_dates[0]
     
@@ -205,7 +207,7 @@ def run_sharpe_screener(
         # 2. Median Daily Turnover: median of (raw_close * volume) over last 252 days
         last_252 = grp.iloc[-252:]
         daily_turnover = last_252["raw_close"] * last_252["volume"]
-        median_turnover_cr = round(float(daily_turnover.median()) / 10_000_000.0, 4)
+        median_turnover_cr = round(float(daily_turnover.median()) / CRORE, 4)
         
         # Base filter check for Turnover
         if median_turnover_cr < turnover_filter_cr:

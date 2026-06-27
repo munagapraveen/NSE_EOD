@@ -92,9 +92,7 @@ class StockDownloader:
                 # Update last_seen_date and detect symbol changes
                 if sec.last_seen_date is None or trade_date > sec.last_seen_date:
                     sec.last_seen_date = trade_date
-                if sec.isin == isin_val and sec.symbol != sym and (sec.last_seen_date is None or trade_date >= sec.last_seen_date):
-                    logger.info(f"Symbol change detected via bhavcopy: {sec.symbol} → {sym} (ISIN: {isin_val})")
-                    sec.symbol = sym
+
                 if isin_val and sec.isin is None:
                     sec.isin = isin_val
                 stock_id_map[(sym, isin_val)] = sec.id

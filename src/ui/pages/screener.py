@@ -218,7 +218,7 @@ def render():
                                 "columnDefs": columns,
                                 "rowData": df_all_sanitized.to_dict(orient="records"),
                                 "rowSelection": "single",
-                                "theme": "balham-dark",
+                                "theme": "balham",
                                 "pagination": True,
                                 "paginationPageSize": 15,
                                 "defaultColDef": {
@@ -247,7 +247,7 @@ def render():
                                     "columnDefs": columns,
                                     "rowData": df_filtered_sanitized.to_dict(orient="records"),
                                     "rowSelection": "single",
-                                    "theme": "balham-dark",
+                                    "theme": "balham",
                                     "pagination": True,
                                     "paginationPageSize": 15,
                                     "defaultColDef": {

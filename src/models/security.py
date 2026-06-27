@@ -11,14 +11,18 @@ class Security(Base):
     __tablename__ = "securities"
 
     id = Column(Integer, Sequence("securities_id_seq"), primary_key=True)
-    symbol = Column(String(30), nullable=False, unique=True, index=True)
+    symbol = Column(String(100), nullable=False, unique=True, index=True)
     company_name = Column(String(200), nullable=True)
     security_type = Column(String(10), nullable=False, index=True)  # STOCK, ETF, INDEX
     isin = Column(String(12), nullable=True, unique=True, index=True)
     face_value = Column(Numeric(10, 2), nullable=True)
     listing_date = Column(Date, nullable=True)
     issued_shares = Column(BigInteger, nullable=True)  # Nullable for ETF/INDEX
-    industry = Column(String(100), nullable=True)
+    # Classification fields — populated by GetQuoteApi (secInfo) on every daily sync
+    industry = Column(String(100), nullable=True)         # secInfo.industryInfo  e.g. "Petroleum Products"
+    basic_industry = Column(String(100), nullable=True)   # secInfo.basicIndustry e.g. "Refineries & Marketing"
+    sector = Column(String(100), nullable=True)           # secInfo.sector        e.g. "Oil Gas & Consumable Fuels"
+    macro_sector = Column(String(50), nullable=True)      # secInfo.macro         e.g. "Energy"
     is_active = Column(Boolean, default=True)
     is_delisted = Column(Boolean, default=False)
     data_source = Column(String(30), default="BHAVCOPY_DISCOVERED")

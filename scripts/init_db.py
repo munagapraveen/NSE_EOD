@@ -4,7 +4,7 @@ import os
 # Append the project's root directory to the python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models.base import Base
+from src.models import Base
 from src.db.engine import engine
 from sqlalchemy import inspect
 

@@ -67,7 +67,7 @@ def render():
             ui.aggrid({
                 "columnDefs": columns,
                 "rowData": changes_data,
-                "theme": "balham-dark",
+                "theme": "balham",
                 "pagination": True,
                 "paginationPageSize": 15,
                 "defaultColDef": {"sortable": True, "resizable": True, "filter": True}

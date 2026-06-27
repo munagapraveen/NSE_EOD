@@ -78,6 +78,7 @@ class NSEClient:
         requires_cookies: bool = False,
         retries: int = None,
         accept_json: bool = False,
+        bypass_rate_limit: bool = False,
     ):
         """
         Make a GET request with rate limiting and 403 retry via cookie refresh.
@@ -89,6 +90,7 @@ class NSEClient:
             requires_cookies: If True, use Chrome-acquired NSE session cookies
             retries: Number of retries (default: settings.nse_max_retries)
             accept_json: If True, override Accept header for API JSON calls
+            bypass_rate_limit: If True, bypass the rate limit delay
 
         Returns:
             curl_cffi Response object
@@ -109,7 +111,8 @@ class NSEClient:
 
         for attempt in range(retries + 1):
             try:
-                await self._rate_limit()
+                if not bypass_rate_limit:
+                    await self._rate_limit()
 
                 request_headers = {}
                 if accept_json:
@@ -119,7 +122,7 @@ class NSEClient:
 
                 response = await self._session.get(url, params=params, headers=request_headers)
 
-                if response.status_code in (401, 403) and requires_cookies:
+                if response.status_code in (401, 403) and requires_cookies and attempt < retries:
                     logger.warning(
                         f"Got {response.status_code} on attempt {attempt + 1}/{retries + 1} "
                         f"— refreshing Chrome cookies..."
@@ -148,8 +151,6 @@ class NSEClient:
                 else:
                     logger.error(f"Request failed after {retries + 1} attempts: {url}")
                     raise
-
-        raise Exception(f"Request failed after max retries: {url}")
 
     # ──────────────────────────────────────────────────────────────────────────
     #  High-Level Download Methods
@@ -267,6 +268,84 @@ class NSEClient:
             accept_json=True
         )
         return response.json()
+
+    async def fetch_get_quote_api(self, symbol: str, series: str = "EQ", bypass_rate_limit: bool = False) -> dict:
+        """
+        Fetch stock data from NSE NextApi GetQuoteApi for a single symbol.
+
+        Returns equityResponse[0] — a dict with keys:
+            metaData   → symbol, companyName, isinCode, series, closePrice
+            tradeInfo  → issuedSize, totalMarketCap, ffmc, faceValue, lastPrice
+            secInfo    → sector, industryInfo, macro, index, indexList, listingDate
+            orderBook  → lastPrice (post-market)
+            lastUpdateTime
+
+        Requires valid NSE session cookies (requires_cookies=True).
+
+        Args:
+            symbol: NSE stock symbol (e.g., 'RELIANCE')
+            series: NSE series code (default 'EQ')
+            bypass_rate_limit: If True, bypass the rate limit delay
+
+        Returns:
+            equityResponse[0] dict, or raises RuntimeError if response is empty.
+        """
+        from config.constants import GET_QUOTE_API_URL
+        response = await self._get(
+            GET_QUOTE_API_URL,
+            params={
+                "functionName": "getSymbolData",
+                "marketType": "N",
+                "series": series,
+                "symbol": symbol,
+            },
+            requires_cookies=True,
+            accept_json=True,
+            headers={"Referer": f"https://www.nseindia.com/get-quote/equity/{symbol}"},
+            bypass_rate_limit=bypass_rate_limit,
+        )
+        data = response.json()
+        equity_response = data.get("equityResponse") or []
+        if not equity_response:
+            raise RuntimeError(f"Empty equityResponse for {symbol}/{series}")
+        return equity_response[0]
+
+    async def fetch_all_quotes_parallel(
+        self,
+        stocks: list[tuple[str, str]],
+        workers: int = 8,
+    ) -> dict[str, dict | None]:
+        """
+        Fetch GetQuoteApi for multiple (symbol, series) pairs concurrently.
+
+        Uses an asyncio.Semaphore to cap parallel requests to `workers` (default 8).
+        Failures per symbol are logged as warnings and recorded as None — they do
+        not abort the batch.
+
+        Args:
+            stocks:  List of (symbol, series) tuples, e.g. [('RELIANCE', 'EQ'), ...]
+            workers: Max concurrent requests (default 8, same as Codex reference)
+
+        Returns:
+            Dict keyed by symbol → equityResponse[0] dict, or None on failure.
+        """
+        semaphore = asyncio.Semaphore(workers)
+        results: dict[str, dict | None] = {}
+
+        async def _fetch_one(symbol: str, series: str):
+            async with semaphore:
+                try:
+                    return symbol, await self.fetch_get_quote_api(symbol, series, bypass_rate_limit=True)
+                except Exception as exc:
+                    logger.warning(f"[GetQuoteApi] Failed for {symbol}/{series}: {exc}")
+                    return symbol, None
+
+        tasks = [_fetch_one(sym, ser) for sym, ser in stocks]
+        for coro in asyncio.as_completed(tasks):
+            sym, data = await coro
+            results[sym] = data
+
+        return results
 
     async def close(self):
         """Close the HTTP session."""

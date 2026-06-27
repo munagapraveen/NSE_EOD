@@ -241,7 +241,7 @@ def render(symbol: str):
                     ui.aggrid({
                         "columnDefs": columns,
                         "rowData": grid_actions,
-                        "theme": "balham-dark",
+                        "theme": "balham",
                         "defaultColDef": {"resizable": True}
                     }).classes("w-full h-[220px]")
                 else:
@@ -287,7 +287,7 @@ def render(symbol: str):
             ui.aggrid({
                 "columnDefs": grid_cols,
                 "rowData": grid_rows,
-                "theme": "balham-dark",
+                "theme": "balham",
                 "pagination": True,
                 "paginationPageSize": 15,
                 "defaultColDef": {"sortable": True, "resizable": True}

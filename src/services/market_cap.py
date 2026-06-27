@@ -6,6 +6,7 @@ from loguru import logger
 
 from src.models import Security, RawPrice, AdjustedPrice, MarketCap, HistoricalShare
 from src.utils.math_utils import truncate_decimal
+from config.constants import CRORE
 
 
 async def calculate_historical_market_cap(session: Session, security_id: int, current_issued_shares: int) -> int:
@@ -99,7 +100,7 @@ async def calculate_historical_market_cap(session: Session, security_id: int, cu
                 continue
             resolved_shares = int(round(current_issued_shares / factor))
 
-        mcap_value = truncate_decimal((resolved_shares * raw_close) / 10_000_000.0, 2)
+        mcap_value = truncate_decimal((resolved_shares * raw_close) / CRORE, 2)
         close_price_truncated = truncate_decimal(raw_close, 2)
 
         records.append({
@@ -108,7 +109,7 @@ async def calculate_historical_market_cap(session: Session, security_id: int, cu
             "close_price": close_price_truncated,
             "issued_shares": resolved_shares,
             "market_cap": mcap_value,
-            "shares_source": "BSE_QUARTERLY_SHP" if hist_shares else "REVERSE_ENGINEERED"
+            "shares_source": "NSE_XBRL_SHP" if hist_shares else "REVERSE_ENGINEERED"
         })
 
     # Delete existing records for this security
@@ -122,7 +123,7 @@ async def calculate_historical_market_cap(session: Session, security_id: int, cu
 
     logger.debug(
         f"Calculated historical market cap for security ID {security_id}: "
-        f"{len(records)} records saved (source: {'BSE_QUARTERLY_SHP' if hist_shares else 'REVERSE_ENGINEERED'})."
+        f"{len(records)} records saved (source: {'NSE_XBRL_SHP' if hist_shares else 'REVERSE_ENGINEERED'})."
     )
     return len(records)
 
@@ -335,28 +336,32 @@ async def calculate_incremental_market_caps_for_range(session: Session, start_da
                 continue
             resolved_shares = int(round(current_shares / factor))
 
-        mcap_value = truncate_decimal((resolved_shares * raw_close) / 10_000_000.0, 2)
+        mcap_value = truncate_decimal((resolved_shares * raw_close) / CRORE, 2)
         records.append({
             "security_id": sec_id,
             "trade_date": trade_date,
             "close_price": truncate_decimal(raw_close, 2),
             "issued_shares": resolved_shares,
             "market_cap": mcap_value,
-            "shares_source": "BSE_QUARTERLY_SHP" if hist_shares else "REVERSE_ENGINEERED"
+            "shares_source": "NSE_XBRL_SHP" if hist_shares else "REVERSE_ENGINEERED"
         })
 
+    # Always delete existing records in range for non-affected securities to prevent stale data
+    delete_query = (
+        delete(MarketCap)
+        .where(MarketCap.trade_date >= start_date)
+        .where(MarketCap.trade_date <= end_date)
+    )
+    if affected_sec_ids:
+        delete_query = delete_query.where(MarketCap.security_id.not_in(affected_sec_ids))
+    session.execute(delete_query)
+
     if records:
-        delete_query = (
-            delete(MarketCap)
-            .where(MarketCap.trade_date >= start_date)
-            .where(MarketCap.trade_date <= end_date)
-        )
-        if affected_sec_ids:
-            delete_query = delete_query.where(MarketCap.security_id.not_in(affected_sec_ids))
-        session.execute(delete_query)
         session.bulk_insert_mappings(MarketCap, records)
         session.commit()
         total_written += len(records)
+    else:
+        session.commit()
 
     logger.info(f"Incremental market cap calculation completed. Total records written: {total_written}")
     return total_written

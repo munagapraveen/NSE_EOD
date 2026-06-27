@@ -16,9 +16,15 @@ def temporary_index_drop(session: Session):
     updating indexed columns on a table with active foreign keys causes
     spurious constraint check failures.
     """
+    dialect_name = session.bind.dialect.name
+    if dialect_name != "duckdb":
+        yield
+        return
+
     def index_exists(name):
         res = session.execute(
-            text(f"SELECT COUNT(*) FROM pg_indexes WHERE indexname = '{name}'")
+            text("SELECT COUNT(*) FROM duckdb_indexes WHERE index_name = :name"),
+            {"name": name}
         ).scalar()
         return res > 0
 
@@ -178,6 +184,41 @@ def _merge_securities(session: Session, old_sec: Security, new_sec: Security):
         .where(HistoricalShare.security_id == new_sec.id)
     ).scalars().all()
     if existing_shares:
+        # Reconcile overlapping historical shares, keeping the richer record
+        old_shares_rows = session.execute(
+            select(HistoricalShare)
+            .where(HistoricalShare.security_id == old_sec.id)
+            .where(HistoricalShare.quarter_date.in_(existing_shares))
+        ).scalars().all()
+        
+        def _non_null_share_count(row):
+            return sum(1 for col in row.__table__.columns
+                       if col.name not in {"id", "security_id", "quarter_date"}
+                       and getattr(row, col.name) is not None)
+
+        for old in old_shares_rows:
+            new = session.execute(
+                select(HistoricalShare)
+                .where(HistoricalShare.security_id == new_sec.id)
+                .where(HistoricalShare.quarter_date == old.quarter_date)
+            ).scalar_one_or_none()
+            if new is None:
+                continue
+            
+            # Keep the row with more non-null fields
+            if _non_null_share_count(old) > _non_null_share_count(new):
+                update_dict = {
+                    col.name: getattr(old, col.name)
+                    for col in HistoricalShare.__table__.columns
+                    if col.name not in {"id", "security_id", "quarter_date"}
+                }
+                session.execute(
+                    update(HistoricalShare)
+                    .where(HistoricalShare.id == new.id)
+                    .values(**update_dict)
+                )
+
+        # After reconciliation, delete the old overlapping rows
         session.execute(
             delete(HistoricalShare)
             .where(HistoricalShare.security_id == old_sec.id)

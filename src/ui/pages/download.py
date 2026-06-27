@@ -36,19 +36,31 @@ class LogStreamer:
                 pass
 
         with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-            # Seek to end of log
-            f.seek(0, 2)
-            # Clear initial value to start fresh
-            self.log_area.value = ""
+            # Pre-populate the buffer with the last 200 lines from the log file
+            import collections
+            last_lines = collections.deque(f, maxlen=200)
             self.buffer.clear()
+            for line in last_lines:
+                self.buffer.append(line.strip())
+            
+            # Update the textarea initially
+            self.log_area.value = "\n".join(self.buffer) + "\n" if self.buffer else ""
+            
+            # Since collections.deque(f) consumes the entire file, the file cursor
+            # is now at the EOF. Subsequent readline calls will read new lines.
             while self.active:
                 try:
-                    line = f.readline()
-                    if line:
-                        clean_line = line.strip()
-                        self.buffer.append(clean_line)
+                    lines_added = False
+                    # Read available lines in batches (up to 100 lines at a time) to prevent WebSocket congestion
+                    for _ in range(100):
+                        line = f.readline()
+                        if not line:
+                            break
+                        self.buffer.append(line.strip())
+                        lines_added = True
+                    
+                    if lines_added:
                         self.log_area.value = "\n".join(self.buffer) + "\n"
-                        # Scroll to bottom
                         try:
                             await self.log_area.client.run_javascript(
                                 f'const el = document.getElementById("c{self.log_area.id}"); '
@@ -57,8 +69,8 @@ class LogStreamer:
                             )
                         except Exception as js_err:
                             logger.debug(f"Failed to scroll log area: {js_err}")
-                    else:
-                        await asyncio.sleep(0.3)
+                    
+                    await asyncio.sleep(0.3)
                 except Exception:
                     # Client disconnected or UI element deleted, stop streaming
                     self.active = False
@@ -74,60 +86,51 @@ def get_last_updated_date():
     try:
         from src.models import Security
         
-        # Find dates with Stocks/ETFs but no Indexes
-        gap_stock = session.query(RawPrice.trade_date).distinct()\
+        # 1. Fetch all distinct trading dates for active Stocks/ETFs
+        stock_dates_rows = session.query(RawPrice.trade_date).distinct()\
             .join(Security, Security.id == RawPrice.security_id)\
             .filter(Security.security_type.in_(["STOCK", "ETF"]))\
             .filter(Security.is_active == True)\
             .filter(~Security.symbol.like("TEST%"))\
             .filter(~Security.symbol.like("MOCK%"))\
-            .filter(~RawPrice.trade_date.in_(
-                session.query(RawPrice.trade_date)
-                .join(Security, Security.id == RawPrice.security_id)
-                .filter(Security.security_type == "INDEX")
-            ))\
-            .order_by(RawPrice.trade_date)\
-            .first()
-            
-        # Find dates with Indexes but no Stocks/ETFs
-        gap_index = session.query(RawPrice.trade_date).distinct()\
+            .all()
+        stock_dates = {r[0] for r in stock_dates_rows if r[0] is not None}
+        
+        # 2. Fetch all distinct trading dates for active Indexes
+        index_dates_rows = session.query(RawPrice.trade_date).distinct()\
             .join(Security, Security.id == RawPrice.security_id)\
             .filter(Security.security_type == "INDEX")\
             .filter(Security.is_active == True)\
             .filter(~Security.symbol.like("TEST%"))\
             .filter(~Security.symbol.like("MOCK%"))\
-            .filter(~RawPrice.trade_date.in_(
-                session.query(RawPrice.trade_date)
-                .join(Security, Security.id == RawPrice.security_id)
-                .filter(Security.security_type.in_(["STOCK", "ETF"]))
-            ))\
-            .order_by(RawPrice.trade_date)\
-            .first()
-            
+            .all()
+        index_dates = {r[0] for r in index_dates_rows if r[0] is not None}
+        
+        # Find dates with Stocks/ETFs but no Indexes
+        gap_stock_dates = stock_dates - index_dates
+        # Find dates with Indexes but no Stocks/ETFs
+        gap_index_dates = index_dates - stock_dates
+        
         first_gap = None
-        if gap_stock and gap_index:
-            first_gap = min(gap_stock[0], gap_index[0])
-        elif gap_stock:
-            first_gap = gap_stock[0]
-        elif gap_index:
-            first_gap = gap_index[0]
+        if gap_stock_dates and gap_index_dates:
+            first_gap = min(min(gap_stock_dates), min(gap_index_dates))
+        elif gap_stock_dates:
+            first_gap = min(gap_stock_dates)
+        elif gap_index_dates:
+            first_gap = min(gap_index_dates)
             
         if first_gap:
             logger.info(f"Detected incomplete daily sync (gap date: {first_gap}). Resuming sync from gap date to backfill.")
             return first_gap - timedelta(days=1)
             
-        # 2. If no gaps, return the max date
-        max_stock = session.query(func.max(RawPrice.trade_date))\
-            .join(Security, Security.id == RawPrice.security_id)\
-            .filter(Security.security_type.in_(["STOCK", "ETF"]))\
-            .scalar()
-        max_index = session.query(func.max(RawPrice.trade_date))\
-            .join(Security, Security.id == RawPrice.security_id)\
-            .filter(Security.security_type == "INDEX")\
-            .scalar()
-        if max_stock and max_index:
-            return min(max_stock, max_index)
-        return max_stock or max_index
+        # 3. If no gaps, return the max date
+        if stock_dates and index_dates:
+            return min(max(stock_dates), max(index_dates))
+        elif stock_dates:
+            return max(stock_dates)
+        elif index_dates:
+            return max(index_dates)
+        return None
     except Exception as e:
         logger.error(f"Failed to fetch last updated date: {e}")
         return None
@@ -209,7 +212,45 @@ def render():
                 .classes("w-full h-[320px] bg-[#14141e] text-slate-300 font-mono text-xs p-4 rounded-lg overflow-y-auto")
 
         log_streamer = LogStreamer(log_area)
-        ui.context.client.on_disconnect(log_streamer.stop)
+
+        # Progress reporting helper defined at page level so it can be re-registered
+        def handle_progress(stage, percentage, msg):
+            try:
+                progress_bar.set_value(percentage / 100.0)
+                progress_lbl.set_text(f"[{stage}] {msg}")
+                if percentage >= 100.0:
+                    progress_card.classes(add="hidden")
+                else:
+                    progress_card.classes(remove="hidden")
+            except Exception:
+                pass
+
+        # Disconnect handling
+        def handle_disconnect():
+            log_streamer.stop()
+            if _sync_manager and _sync_manager.progress_callback == handle_progress:
+                _sync_manager.progress_callback = None
+
+        ui.context.client.on_disconnect(handle_disconnect)
+
+        # Restore UI state if sync is already running in background
+        if _sync_manager and _sync_manager.is_running:
+            running = True
+            from_input.disable()
+            refresh_cb.disable()
+            start_btn.disable()
+            cancel_btn.enable()
+            
+            # Populate active values
+            progress_bar.set_value(_sync_manager.current_progress / 100.0)
+            progress_lbl.set_text(f"[{_sync_manager.current_stage}] {_sync_manager.current_message}")
+            progress_card.classes(remove="hidden")
+            
+            # Attach progress callback
+            _sync_manager.progress_callback = handle_progress
+            
+            # Start streaming the logs
+            asyncio.create_task(log_streamer.start())
 
         # Trigger logic
         async def on_start():
@@ -252,20 +293,11 @@ def render():
                 "force_shares_refresh": refresh_cb.value
             }
 
-            def handle_progress(stage, percentage, msg):
-                try:
-                    progress_bar.set_value(percentage / 100.0)
-                    progress_lbl.set_text(f"[{stage}] {msg}")
-                    # Optional visual change
-                    if percentage >= 100.0:
-                        progress_card.classes("hidden")
-                except Exception:
-                    # Ignore UI update failures when client/page is reloaded or navigated away
-                    pass
-
             # Run sync manager in background
             session = SessionLocal()
             try:
+                # Attach callback
+                _sync_manager.progress_callback = handle_progress
                 summary = await _sync_manager.run_sync(
                     session, dt_from, dt_to, options, progress_callback=handle_progress
                 )
@@ -274,13 +306,14 @@ def render():
                 logger.error(f"Ingestion pipeline failed: {ex}")
                 on_finish("FAILED", str(ex))
             finally:
-                if session.is_active:
-                    session.close()
+                session.close()
 
         def on_finish(status, message):
             nonlocal running
             running = False
             log_streamer.stop()
+            if _sync_manager:
+                _sync_manager.progress_callback = None
             
             # Enable/Disable based on new database state
             last_up = get_last_updated_date()
@@ -308,9 +341,18 @@ def render():
                 ui.notify(f"Data sync failed: {message}", type="negative")
 
         def on_cancel():
-            if running:
+            if _sync_manager and _sync_manager.is_running:
                 _sync_manager.request_cancel()
                 ui.notify("Requesting sync cancellation...", type="warning")
+
+        # Periodically check status to recover UI when background sync completes
+        def check_sync_status():
+            nonlocal running
+            if _sync_manager and not _sync_manager.is_running and running:
+                status = "SUCCESS" if _sync_manager.current_progress >= 100.0 else "FAILED"
+                on_finish(status, _sync_manager.current_message)
+
+        status_timer = ui.timer(2.0, check_sync_status)
 
         # Bind button clicks
         start_btn.on("click", on_start)

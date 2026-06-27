@@ -4,6 +4,7 @@ from nicegui import ui
 from src.db.engine import SessionLocal
 from src.models import Security, RawPrice, MarketCap
 from src.ui.components.stock_table import create_stock_table
+from config.constants import CRORE
 
 
 def get_stocks_list():
@@ -33,7 +34,7 @@ def get_stocks_list():
         
         data = []
         for r in results:
-            mcap_cr = round(float(r.market_cap) / 10000000.0, 2) if r.market_cap else None
+            mcap_cr = round(float(r.market_cap) / CRORE, 2) if r.market_cap else None
             data.append({
                 "symbol": r.symbol,
                 "company_name": r.company_name or "-",

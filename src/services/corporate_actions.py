@@ -55,11 +55,34 @@ def parse_corporate_action_text(purpose: str, subject: str = "") -> dict:
             for m in SPLIT_STRICT_PATTERN.finditer(combined_text):
                 val_str = m.group(1) or m.group(2)
                 if val_str:
-                    matches.append(float(val_str))
+                    start_pos = m.start()
+                    pre_context = combined_text[max(0, start_pos - 15):start_pos].lower()
+                    if any(re.search(r'\b' + re.escape(w) + r'\b', pre_context) for w in ["clause", "section", "rule", "dated"]):
+                        continue
+                    matches.append((float(val_str), start_pos))
                     
             if len(matches) >= 2:
-                old_fv = matches[0]
-                new_fv = matches[1]
+                val0, start0 = matches[0]
+                val1, start1 = matches[1]
+                
+                context0 = combined_text[max(0, start0 - 30):start0].lower()
+                context1 = combined_text[max(0, start1 - 30):start1].lower()
+                
+                old_keywords = ["old", "exist", "prev", "original", "from"]
+                new_keywords = ["new", "sub-divided", "subdivided", "to", "into"]
+                
+                score0_old = sum(1 for kw in old_keywords if re.search(r'\b' + re.escape(kw) + r'\b', context0))
+                score0_new = sum(1 for kw in new_keywords if re.search(r'\b' + re.escape(kw) + r'\b', context0))
+                score1_old = sum(1 for kw in old_keywords if re.search(r'\b' + re.escape(kw) + r'\b', context1))
+                score1_new = sum(1 for kw in new_keywords if re.search(r'\b' + re.escape(kw) + r'\b', context1))
+                
+                if (score0_new > score0_old) or (score1_old > score1_new):
+                    old_fv = val1
+                    new_fv = val0
+                else:
+                    old_fv = val0
+                    new_fv = val1
+
                 if old_fv > new_fv > 0:
                     return {
                         "action_type": "SPLIT",
@@ -180,7 +203,11 @@ class CorporateActionsService:
         new_records_count = 0
         
         # Pre-load security ID mappings by symbol (global lookup to prevent duplicate violations)
-        unique_symbols = {action.get("symbol").strip() for action in raw_actions if action.get("symbol")}
+        unique_symbols = {
+            action.get("symbol").strip()
+            for action in raw_actions
+            if isinstance(action.get("symbol"), str) and action.get("symbol").strip()
+        }
         if not unique_symbols:
             return 0
             
@@ -190,7 +217,8 @@ class CorporateActionsService:
         symbol_to_id = {sec.symbol: sec.id for sec in securities}
 
         for item in raw_actions:
-            sym = item.get("symbol", "").strip()
+            sym_raw = item.get("symbol")
+            sym = sym_raw.strip() if isinstance(sym_raw, str) else ""
             purpose = item.get("purpose", "")
             subject = item.get("subject", "")
             ex_date_str = item.get("exDate")

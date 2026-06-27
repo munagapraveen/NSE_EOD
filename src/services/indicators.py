@@ -75,7 +75,7 @@ async def calculate_indicators_for_security(session: Session, security_id: int) 
     return len(records)
 
 
-async def calculate_all_indicators(session: Session) -> int:
+async def calculate_all_indicators(session: Session, progress_callback=None) -> int:
     """
     Calculate moving averages globally for all active securities (Stocks, ETFs, and Indexes).
     
@@ -92,10 +92,18 @@ async def calculate_all_indicators(session: Session) -> int:
     ).all()
 
     total_written = 0
-    for sec in securities:
+    total = len(securities)
+    for idx, sec in enumerate(securities):
         try:
+            if progress_callback:
+                pct = 90.0 + (idx / total) * 9.0
+                progress_callback("INDICATORS", pct, f"Calculating SMA for {sec.symbol} ({idx+1}/{total})...")
+            
             written = await calculate_indicators_for_security(session, sec.id)
             total_written += written
+            
+            if (idx + 1) % 10 == 0 or (idx + 1) == total:
+                logger.info(f"[{idx+1}/{total}] Calculated SMAs for security {sec.symbol}: {written} records saved")
         except Exception as e:
             logger.error(f"Failed to calculate SMAs for security {sec.symbol} (ID: {sec.id}): {e}")
             session.rollback()
@@ -105,7 +113,7 @@ async def calculate_all_indicators(session: Session) -> int:
     return total_written
 
 
-async def calculate_incremental_indicators_for_range(session: Session, start_date: date, end_date: date) -> int:
+async def calculate_incremental_indicators_for_range(session: Session, start_date: date, end_date: date, progress_callback=None) -> int:
     """
     Calculate SMAs incrementally for a short date range.
     Recalculates full history for securities that had splits/bonuses ex-dating in this range.
@@ -114,6 +122,12 @@ async def calculate_incremental_indicators_for_range(session: Session, start_dat
     """
     from datetime import timedelta
     from src.models import CorporateAction
+
+    # Load active security symbols to map security_id to symbol for logging/progress purposes
+    sec_symbols = {s.id: s.symbol for s in session.execute(
+        select(Security.id, Security.symbol)
+        .where(Security.is_active == True)
+    ).all()}
 
     # 1. Find securities with corporate actions ex-dating in this range
     actions_query = (
@@ -126,9 +140,13 @@ async def calculate_incremental_indicators_for_range(session: Session, start_dat
 
     # 2. Recalculate full history for affected securities
     total_written = 0
-    for sec_id in affected_sec_ids:
+    for idx, sec_id in enumerate(affected_sec_ids):
+        symbol = sec_symbols.get(sec_id, f"ID {sec_id}")
+        if progress_callback:
+            progress_callback("INDICATORS", 90.0, f"Recalculating affected security {symbol}...")
         written = await calculate_indicators_for_security(session, sec_id)
         total_written += written
+        logger.info(f"Recalculated full historical SMAs for affected security {symbol}: {written} records saved")
         await asyncio.sleep(0.01)
 
     # 3. For all other active securities, load adjusted prices from start_date - 365 days to end_date
@@ -147,7 +165,7 @@ async def calculate_incremental_indicators_for_range(session: Session, start_dat
     # Load all adjusted prices in the range in a single query, excluding affected securities
     query = (
         select(AdjustedPrice.security_id, AdjustedPrice.trade_date, AdjustedPrice.adj_close)
-        .where(AdjustedPrice.trade_date >= start_date - timedelta(days=450))
+        .where(AdjustedPrice.trade_date >= start_date - timedelta(days=365))
         .where(AdjustedPrice.trade_date <= end_date)
     )
     if affected_sec_ids:
@@ -168,7 +186,12 @@ async def calculate_incremental_indicators_for_range(session: Session, start_dat
 
     # Group and calculate SMAs per security
     calculated_dfs = []
-    for sec_id, group in df.groupby("security_id"):
+    grouped_list = list(df.groupby("security_id"))
+    total_groups = len(grouped_list)
+    processed_count = 0
+    
+    for sec_id, group in grouped_list:
+        symbol = sec_symbols.get(sec_id, f"ID {sec_id}")
         group = group.sort_values("trade_date").copy()
         group["sma_5"] = ta.sma(group["close"], length=5)
         group["sma_10"] = ta.sma(group["close"], length=10)
@@ -176,6 +199,15 @@ async def calculate_incremental_indicators_for_range(session: Session, start_dat
         group["sma_50"] = ta.sma(group["close"], length=50)
         group["sma_200"] = ta.sma(group["close"], length=200)
         calculated_dfs.append(group)
+        processed_count += 1
+        
+        if progress_callback and processed_count % 50 == 0:
+            pct = 90.0 + (processed_count / total_groups) * 9.0
+            progress_callback("INDICATORS", pct, f"Calculating SMA for {symbol} ({processed_count}/{total_groups})...")
+            
+        if processed_count % 50 == 0 or processed_count == total_groups:
+            logger.info(f"Calculating SMAs: {processed_count}/{total_groups} securities processed (current: {symbol})...")
+            
         await asyncio.sleep(0)
     df_calc = pd.concat(calculated_dfs, ignore_index=True)
 

@@ -31,29 +31,48 @@ class SyncManager:
         self.sc_service = SymbolChangesService(client)
         self._cancel_requested = False
         self.is_running = False
+        
+        # State tracking for UI restoration
+        self.current_stage = "Initializing"
+        self.current_progress = 0.0
+        self.current_message = "Initializing Ingestion pipeline..."
+        self.progress_callback = None
 
-    def _find_securities_with_adj_gaps(self, session: Session) -> set[int]:
-        """Find security IDs that have raw prices but no corresponding adjusted prices on the same dates."""
+    def report_progress(self, stage: str, percentage: float, message: str):
+        """Update active progress state and call UI callback if registered."""
+        self.current_stage = stage
+        self.current_progress = percentage
+        self.current_message = message
+        if self.progress_callback:
+            try:
+                self.progress_callback(stage, percentage, message)
+            except Exception:
+                pass
+
+    def _find_securities_with_adj_gaps(self, session: Session, start_date: date) -> set[int]:
+        """Find security IDs that have raw prices but no corresponding adjusted prices on dates PRIOR to start_date."""
+        from sqlalchemy import exists
         stmt = (
             select(RawPrice.security_id)
-            .outerjoin(
-                AdjustedPrice,
-                (RawPrice.security_id == AdjustedPrice.security_id) & (RawPrice.trade_date == AdjustedPrice.trade_date)
-            )
-            .where(AdjustedPrice.security_id == None)
+            .where(RawPrice.trade_date < start_date)
+            .where(~exists().where(
+                (AdjustedPrice.security_id == RawPrice.security_id) & 
+                (AdjustedPrice.trade_date == RawPrice.trade_date)
+            ))
             .distinct()
         )
         return set(session.execute(stmt).scalars().all())
 
-    def _find_securities_with_ind_gaps(self, session: Session) -> set[int]:
-        """Find active security IDs that have adjusted prices but no corresponding indicators on the same dates."""
+    def _find_securities_with_ind_gaps(self, session: Session, start_date: date) -> set[int]:
+        """Find active security IDs that have adjusted prices but no corresponding indicators on dates PRIOR to start_date."""
+        from sqlalchemy import exists
         stmt = (
             select(AdjustedPrice.security_id)
-            .outerjoin(
-                Indicator,
-                (AdjustedPrice.security_id == Indicator.security_id) & (AdjustedPrice.trade_date == Indicator.trade_date)
-            )
-            .where(Indicator.security_id == None)
+            .where(AdjustedPrice.trade_date < start_date)
+            .where(~exists().where(
+                (Indicator.security_id == AdjustedPrice.security_id) & 
+                (Indicator.trade_date == AdjustedPrice.trade_date)
+            ))
             .distinct()
         )
         return set(session.execute(stmt).scalars().all())
@@ -70,18 +89,23 @@ class SyncManager:
         options: dict,
         progress_callback=None
     ) -> dict:
-        """Wrapper to manage the is_running state flag."""
+        """Wrapper to manage the is_running state flag and progress properties."""
         self.is_running = True
+        self.progress_callback = progress_callback
+        self.current_stage = "Initializing"
+        self.current_progress = 0.0
+        self.current_message = "Initializing Ingestion pipeline..."
         try:
             return await self._run_sync_internal(
                 session=session,
                 start_date=start_date,
                 end_date=end_date,
                 options=options,
-                progress_callback=progress_callback
+                progress_callback=self.report_progress
             )
         finally:
             self.is_running = False
+            self.progress_callback = None
 
     async def _run_sync_internal(
         self,
@@ -105,7 +129,7 @@ class SyncManager:
                     options=options,
                     progress_callback=progress_callback
                 )
-            if summary.get("status") in ("SUCCESS", "PARTIAL"):
+            if summary.get("status") == "SUCCESS":
                 sync_completed_ok = True
             return summary
         finally:
@@ -178,7 +202,9 @@ class SyncManager:
             raise ValueError("ETF Master list is empty. Cannot partition Bhavcopy. Sync aborted to prevent data corruption.")
 
         # Log start of sync log
-        sync_type = "FULL_SYNC" if len(options) > 3 else "PARTIAL_SYNC"
+        sync_stages = ["stocks", "etfs", "indexes", "corporate_actions", "market_cap", "indicators"]
+        is_full_sync = all(options.get(stage, False) for stage in sync_stages)
+        sync_type = "FULL_SYNC" if is_full_sync else "PARTIAL_SYNC"
         existing_log = session.query(SyncLog).filter_by(
             sync_type=sync_type,
             sync_date=end_date
@@ -201,6 +227,8 @@ class SyncManager:
             session.add(sync_log)
         session.commit()
 
+        # Check if database has history BEFORE inserting new prices
+        has_history_pre_sync = session.query(RawPrice).first() is not None
         total_prices_imported = 0
         
         try:
@@ -335,10 +363,9 @@ class SyncManager:
             # If the database is empty/fresh → full (global recalculation of everything).
             # This replaces the old heuristic that was capped at 10 days, which caused
             # a full global recalculation for any catch-up longer than 10 days.
-            has_history = session.query(RawPrice).first() is not None
-            is_incremental = has_history
+            is_incremental = has_history_pre_sync
             logger.info(
-                f"Sync type detection: has_history={has_history}, "
+                f"Sync type detection: has_history={has_history_pre_sync}, "
                 f"range_days={(end_date - start_date).days}, "
                 f"mode={'INCREMENTAL' if is_incremental else 'FULL (fresh database)'}"
             )
@@ -347,8 +374,8 @@ class SyncManager:
             missing_adj_sec_ids = set()
             missing_ind_sec_ids = set()
             if is_incremental:
-                missing_adj_sec_ids = self._find_securities_with_adj_gaps(session)
-                missing_ind_sec_ids = self._find_securities_with_ind_gaps(session)
+                missing_adj_sec_ids = self._find_securities_with_adj_gaps(session, start_date)
+                missing_ind_sec_ids = self._find_securities_with_ind_gaps(session, start_date)
                 if missing_adj_sec_ids or missing_ind_sec_ids:
                     logger.warning(
                         f"Detected post-processing gaps from a previous run! "
@@ -373,6 +400,7 @@ class SyncManager:
                         from src.models import CorporateAction
                         unprocessed_actions = session.query(CorporateAction).filter(
                             CorporateAction.action_type.in_(["SPLIT", "BONUS"]),
+                            CorporateAction.ex_date >= start_date,
                             CorporateAction.ex_date <= end_date,
                             CorporateAction.is_processed == False
                         ).all()
@@ -399,16 +427,34 @@ class SyncManager:
                     progress_callback("SHARES_OUTSTANDING", 70.0, "Fetching outstanding shares from quote API...")
                 try:
                     if options.get("force_shares_refresh"):
-                        # FORCED REFRESH: Fetch and overwrite shares for ALL active stocks
+                        # FORCED REFRESH: Fetch and overwrite shares for ALL active stocks via XBRL
                         await self._fetch_shares_for_all_stocks(session, progress_callback, force_refresh=True)
                     elif is_incremental:
-                        # INCREMENTAL SYNC: Only re-fetch shares for stocks with corporate actions in this range
-                        await self._fetch_shares_for_corporate_action_stocks(
-                            session, start_date, end_date, progress_callback
+                        # HYBRID INCREMENTAL SYNC:
+                        # - Multi-day range: XBRL/CA re-fetch for stocks with splits/bonuses
+                        #   in the intermediate days (start_date → end_date-1 only).
+                        # - Last/current trading day: GetQuoteApi sweep for ALL active stocks
+                        #   (always fresh, catches splits, FPOs, buybacks, ESOPs in one pass).
+                        if start_date < end_date:
+                            # Intermediate days: re-fetch XBRL only for CA-affected stocks
+                            intermediate_end = end_date - timedelta(days=1)
+                            await self._fetch_shares_for_corporate_action_stocks(
+                                session, start_date, intermediate_end, progress_callback
+                            )
+                        # Last trading day: GetQuoteApi for all active stocks
+                        await self._fetch_shares_via_get_quote_api(
+                            session, end_date, progress_callback
                         )
                     else:
-                        # HISTORICAL / FULL SYNC: Fetch shares for ALL stocks with NULL issued_shares
+                        # HISTORICAL / FULL SYNC:
+                        # Step A — XBRL bulk: populates historical quarterly shares
+                        #           (needed for historical market cap time-series accuracy).
                         await self._fetch_shares_for_all_stocks(session, progress_callback)
+                        # Step B — GetQuoteApi: stamps last trading day with freshest issuedSize
+                        #           (same final step as incremental — ensures current record is accurate).
+                        await self._fetch_shares_via_get_quote_api(
+                            session, end_date, progress_callback
+                        )
                 except Exception as e:
                     logger.error(f"Failed to fetch outstanding shares: {e}")
                     failed_stages.append("SHARES_OUTSTANDING")
@@ -468,17 +514,19 @@ class SyncManager:
                 try:
                     if is_incremental:
                         logger.info("Running optimized incremental SMA indicator calculations...")
-                        await calculate_incremental_indicators_for_range(session, start_date, end_date)
+                        await calculate_incremental_indicators_for_range(session, start_date, end_date, progress_callback=progress_callback)
                         
                         affected_ind_sec_ids = missing_ind_sec_ids.union(missing_adj_sec_ids)
                         if affected_ind_sec_ids:
                             logger.info(f"Healing technical indicators for {len(affected_ind_sec_ids)} securities...")
-                            for sec_id in affected_ind_sec_ids:
+                            for idx, sec_id in enumerate(affected_ind_sec_ids):
+                                if progress_callback:
+                                    progress_callback("INDICATORS", 90.0, f"Healing indicator for security ID {sec_id}...")
                                 await calculate_indicators_for_security(session, sec_id)
                                 await asyncio.sleep(0.01)
                     else:
                         logger.info("Running global SMA indicator calculations...")
-                        await calculate_all_indicators(session)
+                        await calculate_all_indicators(session, progress_callback=progress_callback)
                 except Exception as e:
                     logger.error(f"Failed technical indicator calculations: {e}")
                     failed_stages.append("INDICATORS")
@@ -515,204 +563,305 @@ class SyncManager:
 
     # ========== SHARES OUTSTANDING HELPER METHODS ==========
 
-    async def _fetch_issued_shares_batch(
-        self, session: Session, stocks: list, progress_callback=None,
+    async def _fetch_shares_via_nse_xbrl(
+        self, session: Session, stocks: list, start_date: date,
+        progress_callback=None,
         progress_start: float = 65.0, progress_end: float = 75.0, label: str = ""
-    ) -> tuple[int, int, list]:
+    ) -> tuple[int, int]:
         """
-        Fetch issued shares for a list of stocks in batches of 50, using BSEClient to avoid NSE blocks.
-        """
-        from src.services.bse_client import BSEClient
-        
-        BATCH_SIZE = 50
-        BATCH_PAUSE_SECONDS = 5.0
-        SUCCESS_DELAY_SECONDS = 0.5
-        FAILURE_DELAY_SECONDS = 1.0
-        MAX_CONSECUTIVE_FAILURES = 15
-        COOLDOWN_THRESHOLD = 5
-        COOLDOWN_AFTER_STREAK = 10.0
+        Fetch issued shares for a list of stocks via NSE XBRL shareholding filings.
 
+        For each stock, calls the NSE corporate-share-holdings-master endpoint by symbol,
+        downloads the XBRL XML filings, parses outstanding shares, and upserts into
+        historical_shares. Then refreshes Security.issued_shares from the latest record.
+
+        Returns:
+            (success_count, failure_count)
+        """
+        from src.services.historical_shares import sync_historical_shares_for_security
+        
         total = len(stocks)
         if total == 0:
-            return 0, 0, []
+            return 0, 0
 
         success_count = 0
         failure_count = 0
-        consecutive_failures = 0
-        failed_stocks_list = []
-
-        bse_client = BSEClient()
-        try:
-            logger.info(f"{label}Fetching issued shares via BSE for {total} stocks in batches of {BATCH_SIZE}...")
-
-            for batch_idx in range(0, total, BATCH_SIZE):
-                if self._cancel_requested:
-                    break
-
-                batch = stocks[batch_idx:batch_idx + BATCH_SIZE]
-                batch_num = (batch_idx // BATCH_SIZE) + 1
-                total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
-
-                logger.info(f"{label}Starting batch {batch_num}/{total_batches} ({len(batch)} stocks)...")
-
-                for i, stock in enumerate(batch):
-                    if self._cancel_requested:
-                        break
-
-                    global_idx = batch_idx + i
-                    pct = progress_start + (global_idx / total) * (progress_end - progress_start)
-                    if progress_callback:
-                        progress_callback(
-                            "SHARES_OUTSTANDING", pct,
-                            f"{label}Batch {batch_num}/{total_batches} — {stock.symbol} ({global_idx+1}/{total})..."
-                        )
-
-                    try:
-                        if not stock.isin:
-                            logger.warning(f"Stock {stock.symbol} has no ISIN. Skipping BSE lookup.")
-                            failure_count += 1
-                            consecutive_failures += 1
-                            failed_stocks_list.append(stock)
-                            continue
-
-                        scrip_code = await bse_client.lookup_scripcode_by_isin(stock.isin)
-                        if not scrip_code:
-                            logger.warning(f"Could not resolve BSE scripcode for {stock.symbol} (ISIN: {stock.isin})")
-                            failure_count += 1
-                            consecutive_failures += 1
-                            failed_stocks_list.append(stock)
-                            await asyncio.sleep(FAILURE_DELAY_SECONDS)
-                        else:
-                            issued, qtr_date = await bse_client.fetch_outstanding_shares(scrip_code)
-                            if issued and issued > 0:
-                                stock.issued_shares = issued
-                                if qtr_date:
-                                    from src.models import HistoricalShare
-                                    from sqlalchemy import select
-                                    stmt = select(HistoricalShare).where(
-                                        HistoricalShare.security_id == stock.id,
-                                        HistoricalShare.quarter_date == qtr_date
-                                    )
-                                    existing = session.execute(stmt).scalar()
-                                    if existing:
-                                        existing.issued_shares = issued
-                                    else:
-                                        new_share = HistoricalShare(
-                                            security_id=stock.id,
-                                            quarter_date=qtr_date,
-                                            issued_shares=issued,
-                                            source="BSE_QUARTERLY_SHP"
-                                        )
-                                        session.add(new_share)
-                                    
-                                    # Backfill historical quarterly shares for this stock from 2024-01-01
-                                    try:
-                                        from src.services.historical_shares import sync_historical_shares_for_security
-                                        from datetime import date as dt
-                                        await sync_historical_shares_for_security(
-                                            session, stock.id, scrip_code, dt(2024, 1, 1), bse_client
-                                        )
-                                    except Exception as hist_sync_err:
-                                        logger.warning(f"Failed to sync historical shares for {stock.symbol}: {hist_sync_err}")
-                                
-                                session.commit()
-                                success_count += 1
-                                consecutive_failures = 0
-                                logger.info(f"Updated shares outstanding for {stock.symbol} (BSE: {scrip_code}): {issued:,}")
-                                await asyncio.sleep(SUCCESS_DELAY_SECONDS)
-                            else:
-                                logger.warning(f"Failed to fetch/parse outstanding shares from BSE for {stock.symbol} (Scrip: {scrip_code})")
-                                failure_count += 1
-                                consecutive_failures += 1
-                                failed_stocks_list.append(stock)
-                                await asyncio.sleep(FAILURE_DELAY_SECONDS)
-
-                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                            logger.error(
-                                f"{label}Too many consecutive failures ({consecutive_failures}). "
-                                f"Aborting BSE shares fetch stage."
-                            )
-                            return success_count, failure_count, failed_stocks_list
-
-                        if consecutive_failures >= COOLDOWN_THRESHOLD:
-                            logger.warning(
-                                f"{label}{consecutive_failures} consecutive failures — "
-                                f"entering {COOLDOWN_AFTER_STREAK}s cooldown..."
-                            )
-                            await asyncio.sleep(COOLDOWN_AFTER_STREAK)
-
-                    except Exception as e:
-                        logger.warning(f"Error fetching BSE shares for {stock.symbol}: {e}")
-                        failure_count += 1
-                        consecutive_failures += 1
-                        failed_stocks_list.append(stock)
-                        
-                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                            logger.error(
-                                f"{label}Too many consecutive failures ({consecutive_failures}). "
-                                f"Aborting BSE shares fetch stage."
-                            )
-                            return success_count, failure_count, failed_stocks_list
-
-                        await asyncio.sleep(FAILURE_DELAY_SECONDS)
-
-                # Pause between batches (except after the last one)
-                if batch_idx + BATCH_SIZE < total and not self._cancel_requested:
-                    logger.info(
-                        f"{label}Batch {batch_num}/{total_batches} complete "
-                        f"(success: {success_count}, failures: {failure_count}). "
-                        f"Pausing {BATCH_PAUSE_SECONDS}s before next batch..."
-                    )
-                    await asyncio.sleep(BATCH_PAUSE_SECONDS)
-        finally:
-            await bse_client.close()
 
         logger.info(
-            f"{label}BSE Shares outstanding fetch completed. "
+            f"{label}Fetching issued shares via NSE XBRL for {total} stocks..."
+        )
+
+        for idx, stock in enumerate(stocks):
+            if self._cancel_requested:
+                break
+
+            pct = progress_start + (idx / total) * (progress_end - progress_start)
+            if progress_callback:
+                progress_callback(
+                    "SHARES_OUTSTANDING", pct,
+                    f"{label}{stock.symbol} ({idx + 1}/{total})..."
+                )
+
+            try:
+                saved = await sync_historical_shares_for_security(
+                    session, stock.id, stock.symbol, start_date, self.nse_client
+                )
+
+                # Refresh Security.issued_shares from the latest historical record
+                from src.models import HistoricalShare
+                latest = session.execute(
+                    select(HistoricalShare)
+                    .where(HistoricalShare.security_id == stock.id)
+                    .order_by(HistoricalShare.quarter_date.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+
+                if latest and latest.issued_shares:
+                    stock.issued_shares = latest.issued_shares
+                    session.commit()
+                    success_count += 1
+                    logger.info(
+                        f"{label}Updated shares for {stock.symbol}: "
+                        f"{latest.issued_shares:,} (quarter: {latest.quarter_date}, "
+                        f"{saved} XBRL records saved)"
+                    )
+                else:
+                    logger.warning(
+                        f"{label}No XBRL share records found for {stock.symbol}."
+                    )
+                    failure_count += 1
+
+            except Exception as exc:
+                logger.warning(
+                    f"{label}Error fetching NSE XBRL shares for {stock.symbol}: {exc}"
+                )
+                failure_count += 1
+
+        logger.info(
+            f"{label}NSE XBRL shares fetch completed. "
             f"Success: {success_count}, Failures: {failure_count}, Total: {total}"
         )
-        return success_count, failure_count, failed_stocks_list
+        return success_count, failure_count
 
-    async def _fetch_shares_for_all_stocks(self, session: Session, progress_callback=None, force_refresh: bool = False):
+    async def _fetch_shares_for_all_stocks(
+        self, session: Session, progress_callback=None, force_refresh: bool = False
+    ):
         """
-        HISTORICAL / FULL SYNC: Fetch issued shares for ALL active stocks.
-        If force_refresh is False, only fetches for stocks that have NULL issued_shares.
-        Uses batched fetching with pauses to avoid rate limiting.
+        HISTORICAL / FULL SYNC or FORCE REFRESH: Fetch issued shares for active stocks
+        via NSE XBRL shareholding filings (single bulk API call + parallel XBRL parsing).
+
+        If force_refresh is False, only fetches for stocks with NULL issued_shares.
+        If force_refresh is True, re-fetches for ALL active stocks.
         """
-        query = session.query(Security).filter(
+        from src.services.historical_shares import sync_all_historical_shares
+        from config.settings import settings
+
+        label = "[REFRESH] " if force_refresh else "[FULL] "
+
+        if not force_refresh:
+            # Check if there's anything to do
+            missing_count = session.query(Security).filter(
+                Security.security_type == 'STOCK',
+                Security.is_active == True,
+                Security.is_delisted == False,
+                Security.issued_shares == None
+            ).count()
+            if missing_count == 0:
+                logger.info(f"{label}All active stocks already have issued_shares populated.")
+                return
+            logger.info(f"{label}Found {missing_count} stocks with NULL issued_shares.")
+
+        if progress_callback:
+            progress_callback(
+                "SHARES_OUTSTANDING", 66.0,
+                f"{label}Fetching all NSE shareholding filings (bulk XBRL)..."
+            )
+
+        # Use settings start date as historical anchor (default 2024-01-01)
+        fetch_from = settings.nse_start_date
+
+        def _xbrl_progress(pct: float):
+            mapped = 66.0 + pct * 0.12   # map 0-100% into 66-78% overall
+            if progress_callback:
+                progress_callback(
+                    "SHARES_OUTSTANDING", mapped,
+                    f"{label}Parsing XBRL filings... ({pct:.0f}%)"
+                )
+
+        total_saved = await sync_all_historical_shares(
+            session, fetch_from, self.nse_client, progress_callback=_xbrl_progress
+        )
+        logger.info(f"{label}XBRL bulk sync saved {total_saved} quarterly share records.")
+
+        # Refresh Security.issued_shares from latest historical record for each stock
+        if progress_callback:
+            progress_callback(
+                "SHARES_OUTSTANDING", 78.0,
+                f"{label}Updating current share counts from latest quarterly records..."
+            )
+
+        stocks = session.query(Security).filter(
             Security.security_type == 'STOCK',
             Security.is_active == True,
-            Security.is_delisted == False
+            Security.is_delisted == False,
+        ).all()
+
+        from src.models import HistoricalShare
+        updated = 0
+        for stock in stocks:
+            latest = session.execute(
+                select(HistoricalShare)
+                .where(HistoricalShare.security_id == stock.id)
+                .order_by(HistoricalShare.quarter_date.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest and latest.issued_shares:
+                stock.issued_shares = latest.issued_shares
+                updated += 1
+
+        session.commit()
+        logger.info(f"{label}Refreshed Security.issued_shares for {updated} stocks.")
+
+    async def _fetch_shares_via_get_quote_api(
+        self, session: Session, trade_date: date, progress_callback=None
+    ) -> tuple[int, int]:
+        """
+        LAST / CURRENT TRADING DAY: Fetch issuedSize for ALL active stocks via
+        NSE NextApi GetQuoteApi using 8 parallel workers (~1 min for 2000+ stocks).
+
+        This replaces the CA-only XBRL re-fetch for the current trading day.
+        It catches ALL share count changes — splits, bonuses, FPOs, buybacks, ESOPs —
+        not just those tied to a recorded corporate action.
+
+        The actual last trading date is resolved from tradeInfo.secwisedelposdate in
+        the first successful API response, rather than trusting end_date which may
+        be a weekend or public holiday.
+
+        Updates Security.issued_shares for every stock that returns a valid issuedSize.
+
+        Returns:
+            (success_count, failure_count)
+        """
+        stocks = session.query(Security).filter(
+            Security.security_type == 'STOCK',
+            Security.is_active == True,
+            Security.is_delisted == False,
+        ).all()
+
+        if not stocks:
+            logger.info("[GetQuoteApi] No active stocks found — skipping.")
+            return 0, 0
+
+        total = len(stocks)
+        logger.info(
+            f"[GetQuoteApi] Fetching issuedSize for {total} active stocks "
+            f"(requested end_date: {trade_date}, workers: 8)..."
         )
-        if not force_refresh:
-            query = query.filter(Security.issued_shares == None)
-            
-        missing_shares_stocks = query.all()
 
-        if not missing_shares_stocks:
-            logger.info("[FULL] All active stocks already have issued_shares populated.")
-            return
+        if progress_callback:
+            progress_callback(
+                "SHARES_OUTSTANDING", 68.0,
+                f"[GetQuoteApi] Fetching OS shares for {total} stocks..."
+            )
 
-        success, failures, failed_stocks = await self._fetch_issued_shares_batch(
-            session, missing_shares_stocks, progress_callback,
-            progress_start=65.0, progress_end=75.0, label="[FULL] " if not force_refresh else "[REFRESH] "
+        # Build (symbol, series) pairs — default to 'EQ' if series not on Security model
+        pairs = [
+            (s.symbol, getattr(s, "series", None) or "EQ")
+            for s in stocks
+        ]
+        results = await self.nse_client.fetch_all_quotes_parallel(pairs, workers=8)
+
+        # Resolve the actual NSE trading date from the first successful response.
+        # tradeInfo.secwisedelposdate = "22-Jun-2026 00:00:00" reflects the real
+        # last trading date regardless of what calendar day we run this on.
+        actual_trade_date: date = trade_date  # fallback to requested end_date
+        for data in results.values():
+            if not data:
+                continue
+            raw_date_str = (data.get("tradeInfo") or {}).get("secwisedelposdate", "")
+            if raw_date_str:
+                try:
+                    actual_trade_date = datetime.strptime(
+                        raw_date_str.strip(), "%d-%b-%Y %H:%M:%S"
+                    ).date()
+                    break
+                except ValueError:
+                    pass  # malformed — keep fallback
+
+        if actual_trade_date != trade_date:
+            logger.info(
+                f"[GetQuoteApi] Actual NSE trading date resolved from secwisedelposdate: "
+                f"{actual_trade_date} (requested end_date was {trade_date})"
+            )
+
+        success, failure = 0, 0
+        for stock in stocks:
+            data = results.get(stock.symbol)
+            if not data:
+                failure += 1
+                continue
+
+            trade_info = data.get("tradeInfo") or {}
+            sec_info   = data.get("secInfo") or {}
+
+            # --- Issued shares (primary goal) ---
+            issued_size = trade_info.get("issuedSize")
+            if issued_size and isinstance(issued_size, (int, float)) and issued_size > 0:
+                stock.issued_shares = int(issued_size)
+                success += 1
+            else:
+                failure += 1
+
+            # --- Classification fields (fill/refresh on every run) ---
+            # secInfo.industryInfo  e.g. "Petroleum Products"
+            industry_val = (sec_info.get("industryInfo") or "").strip() or None
+            if industry_val:
+                stock.industry = industry_val
+
+            # secInfo.basicIndustry  e.g. "Refineries & Marketing"
+            basic_industry_val = (sec_info.get("basicIndustry") or "").strip() or None
+            if basic_industry_val:
+                stock.basic_industry = basic_industry_val
+
+            # secInfo.sector  e.g. "Oil Gas & Consumable Fuels"
+            sector_val = (sec_info.get("sector") or "").strip() or None
+            if sector_val:
+                stock.sector = sector_val
+
+            # secInfo.macro  e.g. "Energy"
+            macro_val = (sec_info.get("macro") or "").strip() or None
+            if macro_val:
+                stock.macro_sector = macro_val
+
+            # secInfo.listingDate  e.g. "29-Nov-1995 00:00:00"
+            if stock.listing_date is None:
+                raw_listing = (sec_info.get("listingDate") or "").strip()
+                if raw_listing:
+                    try:
+                        stock.listing_date = datetime.strptime(raw_listing, "%d-%b-%Y %H:%M:%S").date()
+                    except ValueError:
+                        pass  # malformed — leave NULL
+
+        session.commit()
+        logger.info(
+            f"[GetQuoteApi] issued_shares + classification fields updated for trading date {actual_trade_date}: "
+            f"{success} success, {failure} failed / no data, out of {total} total stocks."
         )
-
-        if failures > 0 and not self._cancel_requested:
-            if failed_stocks:
-                logger.info(f"[FULL] Retrying {len(failed_stocks)} failed OS shares downloads once more...")
-                await self._fetch_issued_shares_batch(
-                    session, failed_stocks, progress_callback,
-                    progress_start=75.0, progress_end=78.0, label="[FULL RETRY] "
-                )
+        if progress_callback:
+            progress_callback(
+                "SHARES_OUTSTANDING", 75.0,
+                f"[GetQuoteApi] Done — {success}/{total} stocks updated ({actual_trade_date})."
+            )
+        return success, failure
 
     async def _fetch_shares_for_corporate_action_stocks(
         self, session: Session, start_date: date, end_date: date, progress_callback=None
     ):
         """
-        INCREMENTAL SYNC: Only re-fetch issued shares for stocks that had corporate actions
-        (splits/bonuses) with ex-date in the sync date range.
-        These events change the outstanding share count, so we need fresh data from NSE.
+        INTERMEDIATE DAYS (multi-day incremental sync): Re-fetch issued shares via
+        NSE XBRL only for stocks that had corporate actions (splits/bonuses) with
+        ex-date in the given date range (start_date to end_date, exclusive of the
+        last trading day which is handled by GetQuoteApi).
         """
         from src.models import CorporateAction
 
@@ -728,7 +877,7 @@ class SyncManager:
         affected_ids = {row[0] for row in affected_ids}
 
         if not affected_ids:
-            logger.info("[INCR] No corporate actions in date range — skipping shares re-fetch.")
+            logger.info("[INCR] No corporate actions in intermediate date range — skipping XBRL re-fetch.")
             return
 
         # Fetch the Security objects for affected stocks
@@ -745,21 +894,17 @@ class SyncManager:
 
         logger.info(
             f"[INCR] Re-fetching issued shares for {len(affected_stocks)} stocks "
-            f"with corporate actions (ex-date: {start_date} to {end_date})..."
+            f"with corporate actions (ex-date: {start_date} to {end_date}) via NSE XBRL..."
         )
 
-        success, failures, failed_stocks = await self._fetch_issued_shares_batch(
-            session, affected_stocks, progress_callback,
-            progress_start=65.0, progress_end=70.0, label="[INCR] "
-        )
+        # Use the settings start date as the historical anchor for XBRL filings
+        from config.settings import settings
+        fetch_from = settings.nse_start_date
 
-        if failures > 0 and not self._cancel_requested:
-            if failed_stocks:
-                logger.info(f"[INCR] Retrying {len(failed_stocks)} failed OS shares downloads once more...")
-                await self._fetch_issued_shares_batch(
-                    session, failed_stocks, progress_callback,
-                    progress_start=70.0, progress_end=72.0, label="[INCR RETRY] "
-                )
+        await self._fetch_shares_via_nse_xbrl(
+            session, affected_stocks, fetch_from, progress_callback,
+            progress_start=65.0, progress_end=72.0, label="[INCR] "
+        )
 
     def _cancel_summary(self) -> dict:
         logger.warning("Data sync cancelled by user request.")
