@@ -1,8 +1,13 @@
 import json
 import os
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 from typing import Set, List
 from loguru import logger
+
+def get_now_ist() -> datetime:
+    """Get the current datetime in Indian Standard Time (IST - UTC+5:30) as a naive datetime object."""
+    ist_aware = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    return ist_aware.replace(tzinfo=None)
 from src.services.nse_client import NSEClient
 
 
@@ -29,10 +34,6 @@ async def get_nse_holidays(client: NSEClient, cache_path: str = "data/holidays.j
     try:
         logger.info("Fetching trading holidays from NSE API...")
         # Get date ranges from current year - 1 to current year + 1 to cover the required bounds
-        current_year = date.today().year
-        from_date = f"01-01-{current_year - 1}"
-        to_date = f"31-12-{current_year + 1}"
-        
         # Call NSE client for holiday master
         # The holiday-master endpoint is at https://www.nseindia.com/api/holiday-master?type=trading
         response = await client._get(

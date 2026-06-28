@@ -246,7 +246,7 @@ class CorporateActionsService:
             if record_date_str:
                 try:
                     record_date = parse_action_date(record_date_str)
-                except:
+                except Exception:
                     pass
 
             # Parse split/bonus values

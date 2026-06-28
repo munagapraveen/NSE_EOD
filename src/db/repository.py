@@ -28,13 +28,14 @@ def bulk_upsert_raw_prices(session: Session, records: list[dict]) -> int:
             "volume": stmt.excluded.volume,
             "prev_close": stmt.excluded.prev_close,
             "last_price": stmt.excluded.last_price,
+            "turnover": stmt.excluded.turnover,
+            "total_trades": stmt.excluded.total_trades,
         }
         stmt = stmt.on_conflict_do_update(
             index_elements=["security_id", "trade_date"],
             set_=update_dict
         )
         session.execute(stmt)
-        session.commit()
         return len(records)
 
     security_ids = list({r["security_id"] for r in records})
@@ -64,9 +65,6 @@ def bulk_upsert_raw_prices(session: Session, records: list[dict]) -> int:
         session.bulk_update_mappings(RawPrice, update_records)
     if new_records:
         session.bulk_insert_mappings(RawPrice, new_records)
-
-    if new_records or update_records:
-        session.commit()
 
     return len(new_records) + len(update_records)
 

@@ -1,6 +1,7 @@
 import math
+from typing import Any, Optional
 
-def truncate_decimal(val, decimals=2):
+def truncate_decimal(val: Any, decimals: int = 2) -> Optional[float]:
     """
     Truncate a numeric value to a specified number of decimal places.
     Avoids floating-point precision issues by rounding to 9 decimal places
@@ -18,10 +19,10 @@ def truncate_decimal(val, decimals=2):
         val_rounded = round(float_val, 9)
         return int(val_rounded * factor) / factor
     except (TypeError, ValueError, OverflowError):
-        return val
+        return None
 
 
-def safe_float(val, default=0.0):
+def safe_float(val: Any, default: float = 0.0) -> float:
     """
     Convert value to float safely.
     Returns 0.0 if value is NaN or Inf, or default if ValueError/TypeError occurs.
@@ -37,7 +38,7 @@ def safe_float(val, default=0.0):
         return default
 
 
-def safe_int(val, default=0):
+def safe_int(val: Any, default: int = 0) -> int:
     """
     Convert value to int safely by converting to float first.
     Returns default if value is NaN/Inf or if ValueError/TypeError occurs.
@@ -51,4 +52,3 @@ def safe_int(val, default=0):
         return int(f)
     except (TypeError, ValueError):
         return default
-

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, DateTime, Text, UniqueConstraint, Sequence
+from sqlalchemy import Column, Integer, String, Date, DateTime, Text, UniqueConstraint, Sequence, CheckConstraint
 from .base import Base
 
 
@@ -6,6 +6,8 @@ class SyncLog(Base):
     __tablename__ = "sync_log"
     __table_args__ = (
         UniqueConstraint("sync_type", "sync_date", name="uq_sync_log_type_date"),
+        CheckConstraint("status IN ('STARTED', 'SUCCESS', 'FAILED', 'PARTIAL')", name="ck_sync_log_status"),
+        CheckConstraint("sync_type IN ('BHAVCOPY', 'INDEX', 'CORPORATE_ACTIONS', 'MARKET_CAP', 'INDICATORS', 'SYMBOL_CHANGES', 'MASTER_DATA', 'FULL_SYNC', 'PARTIAL_SYNC', 'DAILY_SYNC')", name="ck_sync_log_type"),
     )
 
     id = Column(Integer, Sequence("sync_log_id_seq"), primary_key=True)

@@ -184,7 +184,7 @@ def render():
 
 
             with ui.row().classes("w-full gap-6 mt-1 wrap"):
-                refresh_cb = ui.checkbox("Force Refresh Outstanding Shares", value=False).props("dark")
+                refresh_cb = ui.checkbox("Force Refresh Outstanding Shares", value=False).props("dark disabled")
 
             # Buttons
             with ui.row().classes("w-full gap-4 mt-4"):
@@ -228,6 +228,7 @@ def render():
         # Disconnect handling
         def handle_disconnect():
             log_streamer.stop()
+            status_timer.cancel()
             if _sync_manager and _sync_manager.progress_callback == handle_progress:
                 _sync_manager.progress_callback = None
 
@@ -329,7 +330,7 @@ def render():
                 
             start_btn.enable()
             cancel_btn.disable()
-            refresh_cb.enable()
+            # refresh_cb.enable()
             progress_card.classes(add="hidden")
 
             # Notify user

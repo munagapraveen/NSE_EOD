@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Date, Numeric, String, Boolean, DateTime, ForeignKey, Text, UniqueConstraint, Sequence
+from sqlalchemy import Column, Integer, Date, Numeric, String, Boolean, DateTime, ForeignKey, Text, UniqueConstraint, Sequence, CheckConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from .base import Base
@@ -8,6 +8,7 @@ class CorporateAction(Base):
     __tablename__ = "corporate_actions"
     __table_args__ = (
         UniqueConstraint("security_id", "ex_date", "action_type", name="uq_corporate_action_ex_date_type"),
+        CheckConstraint("action_type IN ('SPLIT', 'BONUS')", name="ck_corporate_action_type"),
     )
 
     id = Column(Integer, Sequence("corporate_actions_id_seq"), primary_key=True)

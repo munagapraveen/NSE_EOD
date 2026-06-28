@@ -1,6 +1,8 @@
 import asyncio
 from src.services.nse_client import NSEClient, HttpNotFoundError, HttpStatusError
 from datetime import date, timedelta, datetime
+from typing import Callable, Optional
+from src.utils.date_utils import get_now_ist
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from loguru import logger
@@ -22,7 +24,6 @@ class SyncManager:
     """Orchestrates the full historical and daily incremental data synchronization workflow."""
 
     def __init__(self, client: NSEClient):
-        self.client = client
         self.nse_client = client
         self.stock_downloader = StockDownloader(client)
         self.etf_downloader = ETFDownloader(client)
@@ -198,6 +199,7 @@ class SyncManager:
             try:
                 await self.etf_downloader.sync_etf_master_list(session)
             except Exception as e:
+                session.rollback()
                 logger.error(f"Failed to sync ETF master list: {e}")
                 failed_stages.append("ETF_MASTER")
                 error_details.append(f"ETF Master: {e}")
@@ -219,7 +221,7 @@ class SyncManager:
         if existing_log:
             sync_log = existing_log
             sync_log.status = "STARTED"
-            sync_log.started_at = datetime.now()
+            sync_log.started_at = get_now_ist()
             sync_log.completed_at = None
             sync_log.error_message = None
             sync_log.records_processed = 0
@@ -228,7 +230,7 @@ class SyncManager:
                 sync_type=sync_type,
                 sync_date=end_date,
                 status="STARTED",
-                started_at=datetime.now()
+                started_at=get_now_ist()
             )
             session.add(sync_log)
         session.commit()
@@ -243,7 +245,7 @@ class SyncManager:
                 if self._cancel_requested:
                     sync_log.status = "FAILED"
                     sync_log.error_message = "Cancel requested by user"
-                    sync_log.completed_at = datetime.now()
+                    sync_log.completed_at = get_now_ist()
                     session.commit()
                     return self._cancel_summary()
                     
@@ -262,7 +264,7 @@ class SyncManager:
                 if options.get("stocks") or options.get("etfs"):
                     date_str = current_date.strftime("%Y%m%d")
                     try:
-                        bhavcopy_df = await self.client.download_bhavcopy_csv(date_str)
+                        bhavcopy_df = await self.nse_client.download_bhavcopy_csv(date_str)
                         has_bhavcopy = True
                     except HttpNotFoundError:
                         logger.warning(f"Bhavcopy 404 for {current_date.isoformat()} (Weekend/Holiday/Delayed). Skipping.")
@@ -308,7 +310,7 @@ class SyncManager:
                 if progress_callback:
                     progress_callback("MASTER_DATA", 55.0, "Enriching stock profiles from master list...")
                 try:
-                    df_equity = await self.client.download_equity_list()
+                    df_equity = await self.nse_client.download_equity_list()
                     # Query existing stocks
                     stocks = session.query(Security).filter(Security.security_type == 'STOCK').all()
                     stock_map = {s.symbol: s for s in stocks}
@@ -347,6 +349,7 @@ class SyncManager:
                     session.commit()
                     logger.info(f"Enriched {enriched_count} stocks. Marked {delisted_count} as delisted.")
                 except Exception as e:
+                    session.rollback()
                     logger.error(f"Failed stock master data enrichment: {e}")
                     failed_stages.append("MASTER_DATA")
                     error_details.append(f"Master Data: {e}")
@@ -359,6 +362,7 @@ class SyncManager:
                 try:
                     await self.sc_service.sync_symbol_changes(session)
                 except Exception as e:
+                    session.rollback()
                     logger.error(f"Failed to sync symbol changes: {e}")
                     failed_stages.append("SYMBOL_CHANGES")
                     error_details.append(f"Symbol Changes: {e}")
@@ -419,9 +423,10 @@ class SyncManager:
                                 logger.info(f"Adjusting issued_shares for {sec.symbol} due to {action.action_type} (ex-date: {action.ex_date}): {old_shares} -> {new_shares}")
                                 sec.issued_shares = new_shares
                             action.is_processed = True
-                            action.processed_at = datetime.now()
+                            action.processed_at = get_now_ist()
                         session.commit()
                 except Exception as e:
+                    session.rollback()
                     logger.error(f"Failed to sync corporate actions: {e}")
                     failed_stages.append("CORPORATE_ACTIONS")
                     error_details.append(f"Corporate Actions: {e}")
@@ -487,6 +492,7 @@ class SyncManager:
                     logger.error(f"Systemic failure in outstanding shares: {re}")
                     raise re
                 except Exception as e:
+                    session.rollback()
                     logger.error(f"Failed to fetch outstanding shares: {e}")
                     failed_stages.append("SHARES_OUTSTANDING")
                     error_details.append(f"Shares Outstanding: {e}")
@@ -511,6 +517,7 @@ class SyncManager:
                         logger.info("Running global price adjustment...")
                         await adjust_all_prices(session, progress_callback=progress_callback)
                 except Exception as e:
+                    session.rollback()
                     logger.error(f"Failed price adjustments: {e}")
                     failed_stages.append("PRICE_ADJUSTMENT")
                     error_details.append(f"Price Adjustment: {e}")
@@ -540,6 +547,7 @@ class SyncManager:
                             logger.info("Running global historical market cap calculations...")
                             await calculate_all_historical_market_caps(session)
                     except Exception as e:
+                        session.rollback()
                         logger.error(f"Failed historical market cap calculations: {e}")
                         failed_stages.append("MARKET_CAP")
                         error_details.append(f"Market Cap: {e}")
@@ -566,6 +574,7 @@ class SyncManager:
                         logger.info("Running global SMA indicator calculations...")
                         await calculate_all_indicators(session, progress_callback=progress_callback)
                 except Exception as e:
+                    session.rollback()
                     logger.error(f"Failed technical indicator calculations: {e}")
                     failed_stages.append("INDICATORS")
                     error_details.append(f"Indicators: {e}")
@@ -585,14 +594,14 @@ class SyncManager:
                 summary["message"] = f"Ingested {total_prices_imported} price records successfully."
                 
             sync_log.records_processed = total_prices_imported
-            sync_log.completed_at = datetime.now()
+            sync_log.completed_at = get_now_ist()
             session.commit()
             
         except Exception as main_err:
             logger.error(f"Sync process aborted due to fatal error: {main_err}")
             sync_log.status = "FAILED"
             sync_log.error_message = str(main_err)
-            sync_log.completed_at = datetime.now()
+            sync_log.completed_at = get_now_ist()
             session.commit()
             raise main_err
 

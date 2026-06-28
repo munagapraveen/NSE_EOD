@@ -118,6 +118,7 @@ class IndexDownloader:
             records_to_insert.append(record)
 
         inserted_count = bulk_upsert_raw_prices(session, records_to_insert)
+        session.commit()
         logger.info(f"Imported {inserted_count} index raw price records for {trade_date.isoformat()}")
         
         return inserted_count

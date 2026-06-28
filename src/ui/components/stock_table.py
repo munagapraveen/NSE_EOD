@@ -22,10 +22,10 @@ def create_stock_table(stocks_data: list[dict]):
          "filter": "agTextColumnFilter"},
         {"headerName": "Close Price", "field": "close", "width": 130,
          "type": "numericColumn",
-         "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+         ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
         {"headerName": "Market Cap (Cr)", "field": "market_cap", "width": 160,
          "type": "numericColumn",
-         "valueFormatter": "x => x.value ? '₹' + Number(x.value).toLocaleString('en-IN') : '-'"},
+         ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toLocaleString('en-IN') : '-'"},
     ]
     
     with ui.column().classes("w-full gap-4"):

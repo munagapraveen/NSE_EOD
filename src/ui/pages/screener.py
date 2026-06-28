@@ -8,15 +8,7 @@ from src.db.engine import SessionLocal
 from src.services.screener import run_sharpe_screener, export_screener_to_excel
 from loguru import logger
 from sqlalchemy import func
-
-# Global storage for results so that we can export them
-current_results = {
-    "df_all": pd.DataFrame(),
-    "df_filtered": pd.DataFrame(),
-    "target_date": date.today(),
-    "long_months": 6,
-    "short_months": 3
-}
+from src.models import RawPrice
 
 
 def get_latest_trade_date() -> date:
@@ -33,6 +25,14 @@ def get_latest_trade_date() -> date:
 
 def render():
     """Render the Sharpe Screener Page."""
+    # Storage for results scoped locally per page render to prevent multi-client data leakage
+    current_results = {
+        "df_all": pd.DataFrame(),
+        "df_filtered": pd.DataFrame(),
+        "target_date": date.today(),
+        "long_months": 6,
+        "short_months": 3
+    }
     latest_db_date = get_latest_trade_date()
     
     with ui.column().classes("w-full gap-6 p-6"):
@@ -65,6 +65,13 @@ def render():
                     value=3, 
                     format="%d"
                 ).props("outlined dark min=1 max=12 step=1").classes("w-64")
+                
+            # Checkboxes for security types
+            with ui.row().classes("w-full gap-6 wrap items-center p-2"):
+                ui.label("Security Types:").classes("text-sm text-slate-300 font-bold")
+                stocks_cb = ui.checkbox("Stocks", value=True).props("dark")
+                etfs_cb = ui.checkbox("ETFs", value=False).props("dark")
+                indexes_cb = ui.checkbox("Indexes", value=False).props("dark")
                 
             with ui.expansion("Advanced Filtering Parameters", icon="tune").classes("text-white w-full border border-white/10 rounded-lg"):
                 with ui.row().classes("w-full gap-6 wrap p-4"):
@@ -112,17 +119,18 @@ def render():
             {"headerName": "Rank", "field": "Avg_sharpe_6_3_Rank", "width": 80, "pinned": "left", "sort": "asc"},
             {"headerName": "Symbol", "field": "symbol", "width": 110, "pinned": "left", "filter": "agTextColumnFilter", "cellStyle": {"fontWeight": "bold", "color": "#818cf8"}},
             {"headerName": "Company Name", "field": "company_name", "width": 240, "filter": "agTextColumnFilter"},
-            {"headerName": "Close (Rs.)", "field": "close", "width": 110, "type": "numericColumn", "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-            {"headerName": "6M Sharpe", "field": "sharpe_6", "width": 115, "type": "numericColumn", "valueFormatter": "x => x.value ? Number(x.value).toFixed(4) : '-'"},
-            {"headerName": "3M Sharpe", "field": "sharpe_3", "width": 115, "type": "numericColumn", "valueFormatter": "x => x.value ? Number(x.value).toFixed(4) : '-'"},
-            {"headerName": "6M ROC", "field": "ROC_6", "width": 100, "type": "numericColumn", "valueFormatter": "x => x.value ? Number(x.value).toFixed(2) + '%' : '-'"},
-            {"headerName": "3M ROC", "field": "ROC_3", "width": 100, "type": "numericColumn", "valueFormatter": "x => x.value ? Number(x.value).toFixed(2) + '%' : '-'"},
-            {"headerName": "Annual ROC", "field": "ROC_annual", "width": 115, "type": "numericColumn", "valueFormatter": "x => x.value ? Number(x.value).toFixed(2) + '%' : '-'"},
-            {"headerName": "Away 52WH", "field": "away_52wh", "width": 120, "type": "numericColumn", "valueFormatter": "x => x.value ? Number(x.value).toFixed(2) + '%' : '-'"},
+            {"headerName": "Type", "field": "security_type", "width": 90, "filter": "agTextColumnFilter"},
+            {"headerName": "Close (Rs.)", "field": "close", "width": 110, "type": "numericColumn", ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+            {"headerName": "6M Sharpe", "field": "sharpe_6", "width": 115, "type": "numericColumn", ":valueFormatter": "x => x.value ? Number(x.value).toFixed(4) : '-'"},
+            {"headerName": "3M Sharpe", "field": "sharpe_3", "width": 115, "type": "numericColumn", ":valueFormatter": "x => x.value ? Number(x.value).toFixed(4) : '-'"},
+            {"headerName": "6M ROC", "field": "ROC_6", "width": 100, "type": "numericColumn", ":valueFormatter": "x => x.value ? Number(x.value).toFixed(2) + '%' : '-'"},
+            {"headerName": "3M ROC", "field": "ROC_3", "width": 100, "type": "numericColumn", ":valueFormatter": "x => x.value ? Number(x.value).toFixed(2) + '%' : '-'"},
+            {"headerName": "Annual ROC", "field": "ROC_annual", "width": 115, "type": "numericColumn", ":valueFormatter": "x => x.value ? Number(x.value).toFixed(2) + '%' : '-'"},
+            {"headerName": "Away 52WH", "field": "away_52wh", "width": 120, "type": "numericColumn", ":valueFormatter": "x => x.value ? Number(x.value).toFixed(2) + '%' : '-'"},
             {"headerName": "Circuit Hits 3M", "field": "total_circuit_hits_3m", "width": 130, "type": "numericColumn"},
-            {"headerName": "Med. Turnover (Cr)", "field": "median_turnover_cr", "width": 150, "type": "numericColumn", "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-            {"headerName": "MCAP (Cr)", "field": "market_cap_cr", "width": 130, "type": "numericColumn", "valueFormatter": "x => x.value ? '₹' + Number(x.value).toLocaleString('en-IN') : '-'"},
-            {"headerName": "52W High", "field": "week_52_high", "width": 110, "type": "numericColumn", "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+            {"headerName": "Med. Turnover (Cr)", "field": "median_turnover_cr", "width": 150, "type": "numericColumn", ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+            {"headerName": "MCAP (Cr)", "field": "market_cap_cr", "width": 130, "type": "numericColumn", ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toLocaleString('en-IN') : '-'"},
+            {"headerName": "52W High", "field": "week_52_high", "width": 110, "type": "numericColumn", ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
             {"headerName": "Industry", "field": "industry", "width": 160, "filter": "agTextColumnFilter"},
             {"headerName": "ISIN", "field": "isin", "width": 140, "filter": "agTextColumnFilter"}
         ]
@@ -146,6 +154,18 @@ def render():
                 ui.notify("Long Window must be greater than or equal to Short Window.", type="negative")
                 return
                 
+            selected_types = []
+            if stocks_cb.value:
+                selected_types.append("STOCK")
+            if etfs_cb.value:
+                selected_types.append("ETF")
+            if indexes_cb.value:
+                selected_types.append("INDEX")
+                
+            if not selected_types:
+                ui.notify("Please select at least one security type.", type="negative")
+                return
+                
             # Start spinner
             status_spinner.classes(remove="hidden")
             status_label.set_text("Analyzing database & running calculations...")
@@ -156,19 +176,22 @@ def render():
             # Allow UI to render spinner before blocking compute
             await ui.run_javascript("new Promise(resolve => setTimeout(resolve, 100))")
             
-            session = SessionLocal()
             try:
-                # 1. Execute Sharpe Screener calculation on worker thread
-                df_all = await asyncio.to_thread(
-                    run_sharpe_screener,
-                    session=session,
-                    target_date=t_date,
-                    long_months=long_val,
-                    short_months=short_val,
-                    mcap_filter_cr=float(mcap_input.value),
-                    roc_annual_filter=float(roc_annual_input.value),
-                    turnover_filter_cr=float(turnover_input.value)
-                )
+                # 1. Execute Sharpe Screener calculation on worker thread using a thread-local session
+                def run_screener_in_thread():
+                    with SessionLocal() as session:
+                        return run_sharpe_screener(
+                            session=session,
+                            target_date=t_date,
+                            long_months=long_val,
+                            short_months=short_val,
+                            mcap_filter_cr=float(mcap_input.value),
+                            roc_annual_filter=float(roc_annual_input.value),
+                            turnover_filter_cr=float(turnover_input.value),
+                            security_types=selected_types
+                        )
+
+                df_all = await asyncio.to_thread(run_screener_in_thread)
                 
                 if df_all.empty:
                     status_label.set_text("No stocks passed the base filters on selected date.")
@@ -269,7 +292,6 @@ def render():
             finally:
                 status_spinner.classes(add="hidden")
                 run_btn.enable()
-                session.close()
 
         async def handle_export():
             if current_results["df_all"].empty:

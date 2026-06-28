@@ -39,6 +39,7 @@ def create_app():
             sec = session.query(Security).filter(Security.symbol == symbol).first()
             active_tab = sec.security_type.lower() + "s" if sec and sec.security_type in ["STOCK", "ETF", "INDEX"] else "stocks"
         except Exception:
+            session.rollback()
             active_tab = "stocks"
         finally:
             session.close()

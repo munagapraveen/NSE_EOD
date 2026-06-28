@@ -25,6 +25,10 @@ def align_database_sequences(engine):
         if engine.dialect.name == "postgresql":
             with engine.begin() as conn:
                 for table, seq in tables_and_seqs:
+                    # Strict validation against allowlist to prevent SQL injection pattern
+                    if (table, seq) not in tables_and_seqs:
+                        logger.error(f"Validation failed for table/sequence: {table}/{seq}")
+                        continue
                     # Check if table exists
                     exists = conn.execute(
                         text("SELECT 1 FROM information_schema.tables WHERE table_name = :table"),
@@ -48,6 +52,10 @@ def align_database_sequences(engine):
             return
         with engine.begin() as conn:
             for table, seq in tables_and_seqs:
+                # Strict validation against allowlist to prevent SQL injection pattern
+                if (table, seq) not in tables_and_seqs:
+                    logger.error(f"Validation failed for table/sequence: {table}/{seq}")
+                    continue
                 # Check if table exists
                 exists_query = text(
                     "SELECT 1 FROM information_schema.tables WHERE table_name = :table"

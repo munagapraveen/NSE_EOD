@@ -271,17 +271,17 @@ def render(symbol: str):
                 
             grid_cols = [
                 {"headerName": "Date", "field": "date", "width": 110, "pinned": "left"},
-                {"headerName": "Raw Close", "field": "raw_close", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "Adj Open", "field": "adj_open", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "Adj High", "field": "adj_high", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "Adj Low", "field": "adj_low", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "Adj Close", "field": "adj_close", "width": 110, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "Adj Volume", "field": "adj_volume", "width": 120, "valueFormatter": "x => x.value ? Number(x.value).toLocaleString() : '-'"},
-                {"headerName": "SMA 5", "field": "sma_5", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "SMA 10", "field": "sma_10", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "SMA 20", "field": "sma_20", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "SMA 50", "field": "sma_50", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
-                {"headerName": "SMA 200", "field": "sma_200", "width": 100, "valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Raw Close", "field": "raw_close", "width": 110, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj Open", "field": "adj_open", "width": 110, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj High", "field": "adj_high", "width": 110, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj Low", "field": "adj_low", "width": 110, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj Close", "field": "adj_close", "width": 110, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "Adj Volume", "field": "adj_volume", "width": 120, ":valueFormatter": "x => x.value ? Number(x.value).toLocaleString() : '-'"},
+                {"headerName": "SMA 5", "field": "sma_5", "width": 100, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "SMA 10", "field": "sma_10", "width": 100, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "SMA 20", "field": "sma_20", "width": 100, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "SMA 50", "field": "sma_50", "width": 100, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
+                {"headerName": "SMA 200", "field": "sma_200", "width": 100, ":valueFormatter": "x => x.value ? '₹' + Number(x.value).toFixed(2) : '-'"},
             ]
             
             ui.aggrid({

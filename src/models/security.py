@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Date, Numeric, BigInteger,
-    Boolean, DateTime, ForeignKey, UniqueConstraint, Sequence
+    Boolean, DateTime, ForeignKey, UniqueConstraint, Sequence, CheckConstraint
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -9,6 +9,9 @@ from .base import Base
 
 class Security(Base):
     __tablename__ = "securities"
+    __table_args__ = (
+        CheckConstraint("security_type IN ('STOCK', 'ETF', 'INDEX')", name="ck_security_type"),
+    )
 
     id = Column(Integer, Sequence("securities_id_seq"), primary_key=True)
     symbol = Column(String(100), nullable=False, unique=True, index=True)

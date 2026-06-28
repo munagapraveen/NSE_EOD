@@ -144,8 +144,8 @@ class StockDownloader:
             }
             records_to_insert.append(record)
 
-        # Bulk upsert the stock prices into the raw_prices table
         inserted_count = bulk_upsert_raw_prices(session, records_to_insert)
+        session.commit()
         logger.info(f"Imported {inserted_count} stock raw price records for {trade_date.isoformat()}")
         
         return inserted_count

@@ -44,7 +44,7 @@ class TestPostgresFeatures(unittest.TestCase):
         from sqlalchemy.dialects.postgresql import dialect as pg_dialect
         compiled_sql = str(called_stmt.compile(dialect=pg_dialect()))
         self.assertIn("ON CONFLICT", compiled_sql)
-        self.assertTrue(mock_session.commit.called)
+        self.assertFalse(mock_session.commit.called)
 
     @patch("src.services.sync_manager.create_db_backup")
     @patch("src.services.sync_manager.prune_old_backups")
@@ -60,8 +60,8 @@ class TestPostgresFeatures(unittest.TestCase):
         sm.etf_downloader.get_all_etf_symbols.return_value = {"TCS"}
         sm.stock_downloader = AsyncMock()
         sm.stock_downloader.import_stock_prices.return_value = 5
-        sm.client = AsyncMock()
-        sm.client.download_bhavcopy_csv.return_value = None
+        sm.nse_client = AsyncMock()
+        sm.nse_client.download_bhavcopy_csv.return_value = None
         
         # Test Case 1: 5% failure rate (minor failure) -> should complete with status PARTIAL
         # Mock _fetch_shares_via_get_quote_api to return 95 successes and 5 failures (5% failure)

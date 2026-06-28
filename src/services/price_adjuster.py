@@ -6,6 +6,7 @@ from loguru import logger
 
 from src.models import Security, RawPrice, AdjustedPrice, CorporateAction
 from src.utils.math_utils import truncate_decimal
+from src.utils.date_utils import get_now_ist
 
 
 async def adjust_prices_for_security(session: Session, security_id: int) -> int:
@@ -49,7 +50,7 @@ async def adjust_prices_for_security(session: Session, security_id: int) -> int:
 
     # 4. Generate adjusted prices
     adjusted_records = []
-    now = datetime.now()
+    now = get_now_ist()
 
     for price in raw_prices:
         trade_date = price.trade_date
@@ -106,6 +107,7 @@ async def adjust_all_prices(session: Session, progress_callback=None) -> int:
     
     securities = session.execute(
         select(Security.id)
+        .where(Security.is_active == True)
     ).scalars().all()
     
     # Load symbols for progress logging

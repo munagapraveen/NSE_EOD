@@ -3,7 +3,7 @@ from datetime import date, datetime
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_, and_
 from sqlalchemy.orm import Session
 from loguru import logger
 from openpyxl import Workbook
@@ -49,7 +49,8 @@ def run_sharpe_screener(
     short_months: int = 3,
     mcap_filter_cr: float = 1000.0,
     roc_annual_filter: float = 6.5,
-    turnover_filter_cr: float = 1.0
+    turnover_filter_cr: float = 1.0,
+    security_types: list[str] = ["STOCK"]
 ) -> pd.DataFrame:
     """
     Runs the Sharpe Based Screener:
@@ -78,19 +79,27 @@ def run_sharpe_screener(
             Security.company_name,
             Security.isin,
             Security.industry,
+            Security.security_type,
             MarketCap.market_cap
         )
-        .join(MarketCap, Security.id == MarketCap.security_id)
-        .where(Security.security_type == "STOCK")
+        .join(MarketCap, Security.id == MarketCap.security_id, isouter=True)
+        .where(Security.security_type.in_(security_types))
         .where(Security.is_active == True)
         .where(Security.is_delisted == False)
-        .where(MarketCap.trade_date == t_date)
-        .where(MarketCap.market_cap >= mcap_threshold_cr)
+        .where(
+            or_(
+                Security.security_type != "STOCK",
+                and_(
+                    MarketCap.trade_date == t_date,
+                    MarketCap.market_cap >= mcap_threshold_cr
+                )
+            )
+        )
     )
     
     mcap_rows = session.execute(mcap_query).all()
     if not mcap_rows:
-        logger.warning(f"No stocks passed the Market Cap filter (>= {mcap_filter_cr} Cr) on {t_date}.")
+        logger.warning(f"No securities of types {security_types} passed the filters on {t_date}.")
         return pd.DataFrame()
         
     passing_stocks = {
@@ -99,12 +108,13 @@ def run_sharpe_screener(
             "company_name": r.company_name or "-",
             "isin": r.isin or "-",
             "industry": r.industry or "-",
-            "market_cap_cr": truncate_decimal(r.market_cap, 2)
+            "security_type": r.security_type,
+            "market_cap_cr": truncate_decimal(r.market_cap, 2) if r.market_cap is not None else None
         }
         for r in mcap_rows
     }
     
-    logger.info(f"Market Cap filter passed: {len(passing_stocks)} stocks.")
+    logger.info(f"Base query passed: {len(passing_stocks)} securities.")
     
     # Get all distinct trading dates up to target date T, sorted ascending
     dates_query = (
@@ -188,6 +198,8 @@ def run_sharpe_screener(
         if len(grp) < 252:
             continue
             
+        stock_meta = passing_stocks[sec_id]
+        grp_sec_type = stock_meta["security_type"]
         adj_close_T = grp.iloc[-1]["adj_close"]
         raw_close_T = grp.iloc[-1]["raw_close"]
         
@@ -200,8 +212,8 @@ def run_sharpe_screener(
             continue
         roc_annual = ((adj_close_T - adj_close_12m) / adj_close_12m) * 100
         
-        # Base filter check for Annual ROC
-        if roc_annual < roc_annual_filter:
+        # Base filter check for Annual ROC (Exempt for non-stocks)
+        if grp_sec_type == "STOCK" and roc_annual < roc_annual_filter:
             continue
             
         # 2. Median Daily Turnover: median of (raw_close * volume) over last 252 days
@@ -209,8 +221,8 @@ def run_sharpe_screener(
         daily_turnover = last_252["raw_close"] * last_252["volume"]
         median_turnover_cr = round(float(daily_turnover.median()) / CRORE, 4)
         
-        # Base filter check for Turnover
-        if median_turnover_cr < turnover_filter_cr:
+        # Base filter check for Turnover (Exempt for non-stocks)
+        if grp_sec_type == "STOCK" and median_turnover_cr < turnover_filter_cr:
             continue
             
         # Stocks passing here are the official base-filtered candidates!
@@ -288,6 +300,7 @@ def run_sharpe_screener(
             "company_name": stock_meta["company_name"],
             "isin": stock_meta["isin"],
             "industry": stock_meta["industry"],
+            "security_type": stock_meta["security_type"],
             "close": raw_close_T,  # raw close price
             "dma_20": dma_20,
             "dma_50": dma_50,
@@ -328,7 +341,7 @@ def run_sharpe_screener(
     df_results.attrs["short_months"] = short_months
     
     output_cols = [
-        "symbol", "company_name", "industry", "close",
+        "symbol", "company_name", "security_type", "industry", "close",
         "dma_20", "dma_50", "dma_100", "dma_200", "away_52wh",
         "total_circuit_hits_3m", "Avg_sharpe_6_3_Rank",
         "sharpe_6", "sharpe_3", "ROC_6", "ROC_3", "week_52_high",
@@ -356,6 +369,7 @@ BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE
 COL_WIDTHS = {
     "symbol": 12,
     "company_name": 28,
+    "security_type": 10,
     "industry": 20,
     "close": 12,
     "dma_20": 10,
@@ -381,6 +395,7 @@ COL_WIDTHS = {
 FRIENDLY_HEADERS = {
     "symbol": "Symbol",
     "company_name": "Company Name",
+    "security_type": "Type",
     "industry": "Industry",
     "close": "Close (Rs.)",
     "dma_20": "20 DMA",

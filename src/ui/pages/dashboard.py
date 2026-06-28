@@ -178,8 +178,8 @@ def render():
                 if gainers:
                     columns = [
                         {"headerName": "Symbol", "field": "symbol", "width": 100, "cellStyle": {"fontWeight": "bold", "color": "#818cf8"}},
-                        {"headerName": "Close", "field": "close", "width": 110, "type": "numericColumn", "valueFormatter": "x => '₹' + Number(x.value).toFixed(2)"},
-                        {"headerName": "Change", "field": "change_pct", "width": 110, "type": "numericColumn", "valueFormatter": "x => '+' + Number(x.value).toFixed(2) + '%'", "cellStyle": {"color": "#10b981", "fontWeight": "500"}}
+                        {"headerName": "Close", "field": "close", "width": 110, "type": "numericColumn", ":valueFormatter": "x => '₹' + Number(x.value).toFixed(2)"},
+                        {"headerName": "Change", "field": "change_pct", "width": 110, "type": "numericColumn", ":valueFormatter": "x => '+' + Number(x.value).toFixed(2) + '%'", "cellStyle": {"color": "#10b981", "fontWeight": "500"}}
                     ]
                     grid = ui.aggrid({
                         "columnDefs": columns,
@@ -200,8 +200,8 @@ def render():
                 if losers:
                     columns = [
                         {"headerName": "Symbol", "field": "symbol", "width": 100, "cellStyle": {"fontWeight": "bold", "color": "#818cf8"}},
-                        {"headerName": "Close", "field": "close", "width": 110, "type": "numericColumn", "valueFormatter": "x => '₹' + Number(x.value).toFixed(2)"},
-                        {"headerName": "Change", "field": "change_pct", "width": 110, "type": "numericColumn", "valueFormatter": "x => Number(x.value).toFixed(2) + '%'", "cellStyle": {"color": "#ef4444", "fontWeight": "500"}}
+                        {"headerName": "Close", "field": "close", "width": 110, "type": "numericColumn", ":valueFormatter": "x => '₹' + Number(x.value).toFixed(2)"},
+                        {"headerName": "Change", "field": "change_pct", "width": 110, "type": "numericColumn", ":valueFormatter": "x => Number(x.value).toFixed(2) + '%'", "cellStyle": {"color": "#ef4444", "fontWeight": "500"}}
                     ]
                     grid = ui.aggrid({
                         "columnDefs": columns,
@@ -224,7 +224,7 @@ def render():
                     {"headerName": "Sync Type", "field": "type", "width": 180},
                     {"headerName": "Sync Date", "field": "date", "width": 120},
                     {"headerName": "Status", "field": "status", "width": 120, 
-                     "cellStyle": "params => ({ color: params.value === 'SUCCESS' ? '#10b981' : params.value === 'STARTED' ? '#f59e0b' : '#ef4444', fontWeight: 'bold' })"},
+                     ":cellStyle": "params => ({ color: params.value === 'SUCCESS' ? '#10b981' : params.value === 'STARTED' ? '#f59e0b' : '#ef4444', fontWeight: 'bold' })"},
                     {"headerName": "Records Processed", "field": "processed", "width": 160, "type": "numericColumn"},
                     {"headerName": "Started At", "field": "started", "width": 120},
                     {"headerName": "Duration", "field": "duration", "width": 100}

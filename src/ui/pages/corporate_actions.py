@@ -81,7 +81,7 @@ def render():
                 {"headerName": "Symbol", "field": "symbol", "width": 110, "cellStyle": {"fontWeight": "bold", "color": "#818cf8"}, "filter": "agTextColumnFilter"},
                 {"headerName": "Company Name", "field": "company_name", "width": 250, "filter": "agTextColumnFilter"},
                 {"headerName": "Action Type", "field": "action_type", "width": 120, "filter": "agTextColumnFilter",
-                 "cellStyle": "params => ({ color: params.value === 'SPLIT' ? '#f59e0b' : '#6366f1', fontWeight: 'bold' })"},
+                 ":cellStyle": "params => ({ color: params.value === 'SPLIT' ? '#f59e0b' : '#6366f1', fontWeight: 'bold' })"},
                 {"headerName": "Ex-Date", "field": "ex_date", "width": 120},
                 {"headerName": "Record Date", "field": "record_date", "width": 120},
                 {"headerName": "Detail Ratio", "field": "detail", "width": 180},

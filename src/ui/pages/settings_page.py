@@ -64,9 +64,11 @@ def save_env_settings(db_url: str, start_date_str: str, delay: float, native: bo
     # Compile new env content
     lines = [f"{k}={v}\n" for k, v in existing_vars.items()]
     
+    temp_env_path = env_path + ".tmp"
     try:
-        with open(env_path, "w", encoding="utf-8") as f:
+        with open(temp_env_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
+        os.replace(temp_env_path, env_path)
             
         # Update settings in-memory
         settings.database_url = db_url
@@ -95,7 +97,7 @@ def render():
             ui.label("Database & Connection Configuration").classes("text-lg font-bold text-white mb-2")
             
             # Database connection URL
-            db_input = ui.input(label="Database URL", value=settings.database_url) \
+            db_input = ui.input(label="Database URL", value=settings.database_url, password=True, password_toggle_button=True) \
                 .props("outlined dark") \
                 .classes("w-full")
             ui.label("Database Connection String (URL). Use a postgresql:// URL for cloud database storage.").classes("text-xs text-slate-500 -mt-4")
@@ -502,22 +504,23 @@ def render():
                 try:
                     url = make_url(db_url)
                     db_name = url.database
-                    term_query = text(f"""
+                    term_query = text("""
                         SELECT pg_terminate_backend(pg_stat_activity.pid)
                         FROM pg_stat_activity
-                        WHERE pg_stat_activity.datname = '{db_name}'
+                        WHERE pg_stat_activity.datname = :db_name
                           AND pid <> pg_backend_pid();
                     """)
                     with engine.connect() as conn:
-                        conn.execute(term_query)
+                        conn.execute(term_query, {"db_name": db_name})
                         logger.info("Successfully terminated other active client connections for database wipe.")
                 except Exception as conn_err:
                     logger.warning(f"Could not terminate other Postgres connections: {conn_err}")
 
+            # Dispose engine after connections are terminated to close this pool too
+            engine.dispose()
+            
             session = SessionLocal()
             try:
-                # Dispose engine after connections are terminated to close this pool too
-                engine.dispose()
                 
                 tables_to_clear = [
                     "sync_log",

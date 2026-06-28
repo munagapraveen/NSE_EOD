@@ -41,29 +41,25 @@ async def calculate_historical_market_cap(session: Session, security_id: int, cu
     hist_shares_rows = session.execute(hist_shares_query).all()
     hist_shares = [(r.quarter_date, r.issued_shares) for r in hist_shares_rows]
     
-    # Map adjustment factor at the quarter_date for each historical quarter
-    # using closest preceding/succeeding trading date factor resolution
+    # Fetch all adjusted price factors in memory for this security once to avoid N+1 query loop
+    adj_rows = session.execute(
+        select(AdjustedPrice.trade_date, AdjustedPrice.adjustment_factor)
+        .where(AdjustedPrice.security_id == security_id)
+        .order_by(AdjustedPrice.trade_date.asc())
+    ).all()
+
+    # Resolve factors locally in Python
     quarter_dates = [q_date for q_date, _ in hist_shares]
     factor_map = {}
     for q_date in quarter_dates:
-        # Find closest preceding factor in DB
-        f = session.execute(
-            select(AdjustedPrice.adjustment_factor)
-            .where(AdjustedPrice.security_id == security_id)
-            .where(AdjustedPrice.trade_date <= q_date)
-            .order_by(AdjustedPrice.trade_date.desc())
-            .limit(1)
-        ).scalar()
-        
-        if f is None:
-            # Fallback to closest succeeding factor in DB (e.g. database starts after quarter end)
-            f = session.execute(
-                select(AdjustedPrice.adjustment_factor)
-                .where(AdjustedPrice.security_id == security_id)
-                .where(AdjustedPrice.trade_date >= q_date)
-                .order_by(AdjustedPrice.trade_date.asc())
-                .limit(1)
-            ).scalar()
+        # Find closest preceding factor
+        preceding = [r for r in adj_rows if r.trade_date <= q_date]
+        if preceding:
+            f = preceding[-1].adjustment_factor
+        else:
+            # Fallback to closest succeeding factor
+            succeeding = [r for r in adj_rows if r.trade_date >= q_date]
+            f = succeeding[0].adjustment_factor if succeeding else None
             
         factor_map[q_date] = float(f) if f is not None else 1.0
 

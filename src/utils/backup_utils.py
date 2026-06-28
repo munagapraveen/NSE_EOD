@@ -6,6 +6,7 @@ from datetime import datetime
 from loguru import logger
 from config.settings import settings
 from sqlalchemy.engine import make_url
+from src.utils.date_utils import get_now_ist
 
 def get_db_file_path() -> str:
     """Helper to extract the physical database file path from settings."""
@@ -32,7 +33,7 @@ def create_db_backup() -> str:
         backup_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(db_path))), "backups")
         os.makedirs(backup_dir, exist_ok=True)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        timestamp = get_now_ist().strftime("%Y%m%d_%H%M%S_%f")
         backup_filename = f"market_backup_{timestamp}.db"
         backup_path = os.path.join(backup_dir, backup_filename)
 
@@ -52,7 +53,7 @@ def create_db_backup() -> str:
             backup_dir = os.path.join(os.getcwd(), "backups")
             os.makedirs(backup_dir, exist_ok=True)
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            timestamp = get_now_ist().strftime("%Y%m%d_%H%M%S_%f")
             backup_filename = f"market_backup_{timestamp}.dump"
             backup_path = os.path.join(backup_dir, backup_filename)
 
@@ -73,12 +74,14 @@ def create_db_backup() -> str:
             ]
 
             try:
-                res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+                res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
                 if res.returncode == 0:
                     logger.info(f"Successfully created PostgreSQL database backup: {backup_path}")
                     return backup_path
                 else:
                     logger.error(f"pg_dump failed with error: {res.stderr}")
+            except subprocess.TimeoutExpired:
+                logger.error("pg_dump timed out after 600 seconds.")
             except FileNotFoundError:
                 # Search standard Windows installation paths for pg_dump.exe
                 pg_paths = glob.glob(r"C:\Program Files\PostgreSQL\*\bin\pg_dump.exe")
@@ -86,12 +89,15 @@ def create_db_backup() -> str:
                     pg_paths.sort()
                     pg_dump_exe = pg_paths[-1]
                     cmd[0] = pg_dump_exe
-                    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
-                    if res.returncode == 0:
-                        logger.info(f"Successfully created PostgreSQL database backup using path: {backup_path}")
-                        return backup_path
-                    else:
-                        logger.error(f"pg_dump path failed with error: {res.stderr}")
+                    try:
+                        res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+                        if res.returncode == 0:
+                            logger.info(f"Successfully created PostgreSQL database backup using path: {backup_path}")
+                            return backup_path
+                        else:
+                            logger.error(f"pg_dump path failed with error: {res.stderr}")
+                    except subprocess.TimeoutExpired:
+                        logger.error("pg_dump timed out after 600 seconds during fallback execution.")
                 else:
                     logger.error("pg_dump utility not found in PATH or standard installation directories.")
             return ""
@@ -193,13 +199,16 @@ def restore_db_from_backup(backup_path: str) -> bool:
             ]
 
             try:
-                res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+                res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
                 if res.returncode in (0, 1):  # pg_restore returncode 1 is warning which is acceptable
                     logger.info(f"Successfully restored PostgreSQL database from: {backup_path}")
                     return True
                 else:
                     logger.error(f"pg_restore failed with error: {res.stderr}")
                     return False
+            except subprocess.TimeoutExpired:
+                logger.error("pg_restore timed out after 600 seconds.")
+                return False
             except FileNotFoundError:
                 # Search standard Windows installation paths for pg_restore.exe
                 pg_paths = glob.glob(r"C:\Program Files\PostgreSQL\*\bin\pg_restore.exe")
@@ -207,12 +216,15 @@ def restore_db_from_backup(backup_path: str) -> bool:
                     pg_paths.sort()
                     pg_restore_exe = pg_paths[-1]
                     cmd[0] = pg_restore_exe
-                    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
-                    if res.returncode in (0, 1):
-                        logger.info(f"Successfully restored PostgreSQL database using path from: {backup_path}")
-                        return True
-                    else:
-                        logger.error(f"pg_restore path failed with error: {res.stderr}")
+                    try:
+                        res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+                        if res.returncode in (0, 1):
+                            logger.info(f"Successfully restored PostgreSQL database using path from: {backup_path}")
+                            return True
+                        else:
+                            logger.error(f"pg_restore path failed with error: {res.stderr}")
+                    except subprocess.TimeoutExpired:
+                        logger.error("pg_restore timed out after 600 seconds during fallback execution.")
                 else:
                     logger.error("pg_restore utility not found in PATH or standard installation directories.")
                 return False

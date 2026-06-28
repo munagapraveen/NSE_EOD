@@ -1,6 +1,7 @@
 import asyncio
 import io
 import zipfile
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -28,6 +29,8 @@ class NSEClient:
 
     def __init__(self):
         self._session: Optional[AsyncSession] = None
+        self._session_lock = asyncio.Lock()
+        self._last_session_refresh: Optional[datetime] = None
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Session & Cookie Management
@@ -38,32 +41,44 @@ class NSEClient:
         Ensure curl_cffi session exists with fresh cookies.
         Creates or re-creates the session and visits NSE homepage to establish cookies.
         """
-        has_no_cookies = False
-        if self._session is not None:
-            try:
-                if not self._session.cookies or len(self._session.cookies) == 0:
-                    has_no_cookies = True
-            except Exception:
-                has_no_cookies = True
+        async with self._session_lock:
+            # Prevent thundering herd of cookie refreshes if updated within 15 seconds
+            now = datetime.now()
+            is_recent_refresh = (
+                self._last_session_refresh is not None 
+                and (now - self._last_session_refresh).total_seconds() < 15.0
+            )
+            
+            if force_cookie_refresh and is_recent_refresh:
+                logger.info("NSEClient: Ignoring redundant cookie refresh request (refreshed recently).")
+                force_cookie_refresh = False
 
-        if self._session is None or force_cookie_refresh or has_no_cookies:
-            # Close old session if refreshing
+            has_no_cookies = False
             if self._session is not None:
-                await self._session.close()
-
-            self._session = AsyncSession(
-                headers=NSE_HEADERS,
-                impersonate=self.IMPERSONATE_BROWSER,
-                timeout=30,
-                allow_redirects=True,
-                verify=True,
-            )
-            # Visit homepage to establish cookies
-            await self._session.get("https://www.nseindia.com/")
-            logger.debug(
-                f"NSEClient: Session {'refreshed' if force_cookie_refresh else 'created'} "
-                f"by visiting homepage directly."
-            )
+                try:
+                    if not self._session.cookies or len(self._session.cookies) == 0:
+                        has_no_cookies = True
+                except Exception:
+                    has_no_cookies = True
+    
+            if self._session is None or force_cookie_refresh or has_no_cookies:
+                # Close old session if refreshing
+                if self._session is not None:
+                    await self._session.close()
+    
+                self._session = AsyncSession(
+                    impersonate=self.IMPERSONATE_BROWSER,
+                    timeout=30,
+                    allow_redirects=True,
+                    verify=True,
+                )
+                # Visit homepage to establish cookies
+                await self._session.get("https://www.nseindia.com/")
+                self._last_session_refresh = datetime.now()
+                logger.debug(
+                    f"NSEClient: Session {'refreshed' if force_cookie_refresh else 'created'} "
+                    f"by visiting homepage directly."
+                )
 
     async def _rate_limit(self):
         """Minimum delay between sequential API calls."""
@@ -104,7 +119,6 @@ class NSEClient:
             # For non-cookie requests (archive downloads), a plain session is fine
             if self._session is None:
                 self._session = AsyncSession(
-                    headers=NSE_HEADERS,
                     impersonate=self.IMPERSONATE_BROWSER,
                     timeout=30,
                 )
@@ -171,8 +185,14 @@ class NSEClient:
         response = await self._get(url, requires_cookies=False)
 
         zip_buffer = io.BytesIO(response.content)
+        if not zipfile.is_zipfile(zip_buffer):
+            raise ValueError(f"Downloaded content for {trade_date} is not a valid zip file. Length: {len(response.content)} bytes")
+
         with zipfile.ZipFile(zip_buffer) as zf:
-            csv_filename = zf.namelist()[0]
+            names = zf.namelist()
+            if not names:
+                raise ValueError(f"Zip file for {trade_date} contains no files.")
+            csv_filename = names[0]
             with zf.open(csv_filename) as csv_file:
                 df = pd.read_csv(csv_file)
         return df
@@ -308,12 +328,25 @@ class NSEClient:
         equity_response = data.get("equityResponse") or []
         if not equity_response:
             raise RuntimeError(f"Empty equityResponse for {symbol}/{series}")
-        return equity_response[0]
+            
+        res_data = equity_response[0]
+        # Fallback to BE series if EQ returned all None values (indicating stock might be in BE series)
+        if series == "EQ" and res_data.get("metaData") is None:
+            logger.info(f"NSEClient: {symbol} returned empty metadata for EQ series. Retrying with BE series...")
+            try:
+                be_data = await self.fetch_get_quote_api(symbol, series="BE", bypass_rate_limit=bypass_rate_limit)
+                if be_data.get("metaData") is not None:
+                    return be_data
+            except Exception as e:
+                logger.warning(f"NSEClient: Fallback to BE series failed for {symbol}: {e}")
+                
+        return res_data
 
     async def fetch_all_quotes_parallel(
         self,
         stocks: list[tuple[str, str]],
         workers: int = 8,
+        bypass_rate_limit: bool = False,
     ) -> dict[str, dict | None]:
         """
         Fetch GetQuoteApi for multiple (symbol, series) pairs concurrently.
@@ -325,6 +358,7 @@ class NSEClient:
         Args:
             stocks:  List of (symbol, series) tuples, e.g. [('RELIANCE', 'EQ'), ...]
             workers: Max concurrent requests (default 8, same as Codex reference)
+            bypass_rate_limit: If False, respect the settings.nse_request_delay_seconds delay.
 
         Returns:
             Dict keyed by symbol → equityResponse[0] dict, or None on failure.
@@ -335,7 +369,7 @@ class NSEClient:
         async def _fetch_one(symbol: str, series: str):
             async with semaphore:
                 try:
-                    return symbol, await self.fetch_get_quote_api(symbol, series, bypass_rate_limit=True)
+                    return symbol, await self.fetch_get_quote_api(symbol, series, bypass_rate_limit=bypass_rate_limit)
                 except Exception as exc:
                     logger.warning(f"[GetQuoteApi] Failed for {symbol}/{series}: {exc}")
                     return symbol, None

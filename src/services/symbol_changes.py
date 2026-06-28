@@ -6,6 +6,7 @@ from loguru import logger
 
 from src.models import Security, SymbolChange
 from src.services.nse_client import NSEClient
+from src.utils.date_utils import get_now_ist
 
 
 @contextmanager
@@ -16,7 +17,7 @@ def temporary_index_drop(session: Session):
     updating indexed columns on a table with active foreign keys causes
     spurious constraint check failures.
     """
-    dialect_name = session.bind.dialect.name
+    dialect_name = session.get_bind().dialect.name
     if dialect_name != "duckdb":
         yield
         return
@@ -339,7 +340,7 @@ class SymbolChangesService:
                             _merge_securities(session, old_sec, new_sec_exists)
                             change_rec.security_id = new_sec_exists.id
                             change_rec.is_applied = True
-                            change_rec.applied_at = datetime.now()
+                            change_rec.applied_at = get_now_ist()
                             applied_count += 1
                         else:
                             logger.info(f"Applying symbol change: {old_sym} -> {new_sym} (Security ID: {old_sec.id})")
@@ -349,7 +350,7 @@ class SymbolChangesService:
                             
                             change_rec.security_id = old_sec.id
                             change_rec.is_applied = True
-                            change_rec.applied_at = datetime.now()
+                            change_rec.applied_at = get_now_ist()
                             applied_count += 1
 
             if new_recorded_count > 0 or applied_count > 0:
@@ -388,14 +389,14 @@ class SymbolChangesService:
                         _merge_securities(session, old_sec, new_sec_exists)
                         change.security_id = new_sec_exists.id
                         change.is_applied = True
-                        change.applied_at = datetime.now()
+                        change.applied_at = get_now_ist()
                         applied_count += 1
                     else:
                         logger.info(f"Applying pending symbol change: {change.old_symbol} -> {change.new_symbol} (ID: {old_sec.id})")
                         old_sec.symbol = change.new_symbol
                         change.security_id = old_sec.id
                         change.is_applied = True
-                        change.applied_at = datetime.now()
+                        change.applied_at = get_now_ist()
                         applied_count += 1
 
             if applied_count > 0:

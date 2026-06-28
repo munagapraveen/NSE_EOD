@@ -16,7 +16,17 @@ if db_url.startswith("duckdb:///"):
             os.makedirs(db_dir, exist_ok=True)
 
 # Create engine
-engine = create_engine(db_url, echo=False)
+if "postgresql" in db_url:
+    engine = create_engine(
+        db_url,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+        pool_timeout=30
+    )
+else:
+    engine = create_engine(db_url, echo=False)
 
 # Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
