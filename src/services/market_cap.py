@@ -119,7 +119,6 @@ async def calculate_historical_market_cap(session: Session, security_id: int, cu
 
     if records:
         session.bulk_insert_mappings(MarketCap, records)
-        session.commit()
 
     logger.debug(
         f"Calculated historical market cap for security ID {security_id}: "
@@ -148,18 +147,16 @@ async def calculate_all_historical_market_caps(session: Session) -> int:
 
     total_written = 0
     for stock in stocks:
-        try:
-            if stock.issued_shares:
-                written = await calculate_historical_market_cap(
-                    session, stock.id, stock.issued_shares
-                )
-                total_written += written
-            else:
-                logger.warning(f"Stock {stock.symbol} (ID: {stock.id}) has NULL issued_shares. Skipping.")
-        except Exception as e:
-            logger.error(f"Failed to calculate market cap for stock {stock.symbol} (ID: {stock.id}): {e}")
-            session.rollback()
+        if stock.issued_shares:
+            written = await calculate_historical_market_cap(
+                session, stock.id, stock.issued_shares
+            )
+            total_written += written
+        else:
+            logger.warning(f"Stock {stock.symbol} (ID: {stock.id}) has NULL issued_shares. Skipping.")
         await asyncio.sleep(0.01)
+        
+    session.commit()
 
     logger.info(f"Global historical market cap calculation completed. Total records written: {total_written}")
     return total_written

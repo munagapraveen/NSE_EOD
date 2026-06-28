@@ -5,7 +5,7 @@ from pathlib import Path
 
 class Settings(BaseSettings):
     # Database Configuration
-    database_url: str = "duckdb:///data/market.db"
+    database_url: str = "postgresql://nse_user:secure_password_here@localhost:5432/nse_eod"
 
     # NSE Configurations
     nse_start_date: date = date(2024, 1, 1)

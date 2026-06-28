@@ -6,6 +6,7 @@ from .corporate_action import CorporateAction
 from .symbol_change import SymbolChange
 from .sync_log import SyncLog
 from .historical_share import HistoricalShare
+from .security_index import SecurityIndex
 
 __all__ = [
     "Base",
@@ -18,4 +19,5 @@ __all__ = [
     "SymbolChange",
     "SyncLog",
     "HistoricalShare",
+    "SecurityIndex",
 ]

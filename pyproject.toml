@@ -10,8 +10,8 @@ dependencies = [
 
     # --- Database ---
     "sqlalchemy>=2.0.36",
-    "duckdb>=1.2.0",
-    "duckdb-engine>=0.15.0",
+    "psycopg2-binary>=2.9.0",
+    "asyncpg>=0.30.0",
     "alembic>=1.14.0",
 
     # --- Data Processing ---
@@ -45,11 +45,8 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "ruff>=0.8.0",
-]
-
-cloud = [
-    "asyncpg>=0.30.0",
-    "psycopg2-binary>=2.9.0",
+    "duckdb>=1.2.0",
+    "duckdb-engine>=0.15.0",
 ]
 
 [project.scripts]

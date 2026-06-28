@@ -86,8 +86,6 @@ async def adjust_prices_for_security(session: Session, security_id: int) -> int:
     for action in actions:
         action.is_processed = True
         action.processed_at = now
-
-    session.commit()
     
     logger.debug(
         f"Adjusted prices updated for security ID {security_id}: "
@@ -97,7 +95,7 @@ async def adjust_prices_for_security(session: Session, security_id: int) -> int:
     return len(adjusted_records)
 
 
-async def adjust_all_prices(session: Session) -> int:
+async def adjust_all_prices(session: Session, progress_callback=None) -> int:
     """
     Run price adjustment calculation for all securities.
     
@@ -110,21 +108,34 @@ async def adjust_all_prices(session: Session) -> int:
         select(Security.id)
     ).scalars().all()
     
+    # Load symbols for progress logging
+    sec_symbols = {s.id: s.symbol for s in session.execute(
+        select(Security.id, Security.symbol)
+        .where(Security.is_active == True)
+    ).all()}
+    
     total_written = 0
-    for sec_id in securities:
-        try:
-            written = await adjust_prices_for_security(session, sec_id)
-            total_written += written
-        except Exception as e:
-            logger.error(f"Failed to adjust prices for security ID {sec_id}: {e}")
-            session.rollback()
+    total = len(securities)
+    for idx, sec_id in enumerate(securities):
+        symbol = sec_symbols.get(sec_id, f"ID {sec_id}")
+        if progress_callback:
+            pct = 80.0 + (idx / total) * 4.0
+            progress_callback("PRICE_ADJUSTMENT", pct, f"Adjusting price for {symbol} ({idx+1}/{total})...")
+            
+        written = await adjust_prices_for_security(session, sec_id)
+        total_written += written
+        
+        if (idx + 1) % 50 == 0 or (idx + 1) == total:
+            logger.info(f"[{idx+1}/{total}] Adjusted prices for security {symbol}: {written} records saved")
         await asyncio.sleep(0.01)
+            
+    session.commit()
             
     logger.info(f"Global price adjustment completed. Total records adjusted: {total_written}")
     return total_written
 
 
-async def adjust_incremental_prices(session: Session, start_date: date, end_date: date) -> int:
+async def adjust_incremental_prices(session: Session, start_date: date, end_date: date, progress_callback=None) -> int:
     """
     Fast incremental price adjustments for a short date range.
     Only recalculates full history for securities that had splits/bonuses ex-dating in this range.
@@ -132,6 +143,12 @@ async def adjust_incremental_prices(session: Session, start_date: date, end_date
     using their existing cumulative adjustment factors.
     """
     from sqlalchemy import func
+    
+    # Load active security symbols to map security_id to symbol for progress/logging purposes
+    sec_symbols = {s.id: s.symbol for s in session.execute(
+        select(Security.id, Security.symbol)
+        .where(Security.is_active == True)
+    ).all()}
     
     # 1. Find securities with corporate actions ex-dating in this range
     actions_query = (
@@ -144,7 +161,11 @@ async def adjust_incremental_prices(session: Session, start_date: date, end_date
     
     # 2. Recalculate full history for affected securities
     for sec_id in affected_sec_ids:
+        symbol = sec_symbols.get(sec_id, f"ID {sec_id}")
+        if progress_callback:
+            progress_callback("PRICE_ADJUSTMENT", 80.0, f"Recalculating split adjustments for {symbol}...")
         await adjust_prices_for_security(session, sec_id)
+        logger.info(f"Recalculated full split/bonus historical adjusted prices for affected security {symbol}")
         await asyncio.sleep(0.01)
         
     # 3. For all other securities, copy today's raw prices using their latest known factor
@@ -178,7 +199,9 @@ async def adjust_incremental_prices(session: Session, start_date: date, end_date
     raw_prices = session.execute(raw_prices_query).scalars().all()
     
     adjusted_records = []
-    for rp in raw_prices:
+    total_prices = len(raw_prices)
+    for idx, rp in enumerate(raw_prices):
+        symbol = sec_symbols.get(rp.security_id, f"ID {rp.security_id}")
         factor = factor_map.get(rp.security_id, 1.0)
         if factor <= 0:
             factor = 1.0
@@ -192,6 +215,18 @@ async def adjust_incremental_prices(session: Session, start_date: date, end_date
             "adj_volume": int(round(float(rp.volume) * factor)),
             "adjustment_factor": round(factor, 6)
         })
+        
+        # Periodically update progress callback (every 100 prices)
+        if progress_callback and (idx + 1) % 100 == 0:
+            pct = 80.0 + ((idx + 1) / total_prices) * 4.0  # Map to 80% - 84% range
+            progress_callback("PRICE_ADJUSTMENT", pct, f"Adjusting price for {symbol} ({idx+1}/{total_prices})...")
+            
+        if (idx + 1) % 100 == 0 or (idx + 1) == total_prices:
+            logger.info(f"Adjusting prices: {idx+1}/{total_prices} security records processed (current: {symbol})...")
+            
+        # Yield control to prevent blocking event loop too long
+        if (idx + 1) % 100 == 0:
+            await asyncio.sleep(0)
         
     if adjusted_records:
         delete_query = delete(AdjustedPrice).where(AdjustedPrice.trade_date >= start_date).where(AdjustedPrice.trade_date <= end_date)

@@ -39,6 +39,7 @@ class Security(Base):
     market_caps = relationship("MarketCap", back_populates="security", primaryjoin="Security.id == MarketCap.security_id", foreign_keys="MarketCap.security_id", cascade="all, delete-orphan")
     symbol_changes = relationship("SymbolChange", back_populates="security", primaryjoin="Security.id == SymbolChange.security_id", foreign_keys="SymbolChange.security_id", cascade="all, delete-orphan")
     historical_shares = relationship("HistoricalShare", back_populates="security", primaryjoin="Security.id == HistoricalShare.security_id", foreign_keys="HistoricalShare.security_id", cascade="all, delete-orphan")
+    security_indexes = relationship("SecurityIndex", back_populates="security", primaryjoin="Security.id == SecurityIndex.security_id", foreign_keys="SecurityIndex.security_id", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Security(symbol={self.symbol}, type={self.security_type}, active={self.is_active})>"

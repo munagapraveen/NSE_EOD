@@ -9,4 +9,5 @@
 - **Then Run it** Only after all of that: let auto mode run
 - **Strict Adherence:** Perform ONLY the tasks explicitly requested by the user.
 - **Informed Modifications:** Do NOT modify any code or the database without first informing and receiving confirmation from the user.
+- **No Automatic Cloud Deployment:** Do NOT automatically deploy local code changes to the cloud VM or restart services on the VM without explicit user request/consent.
 - **Ignore Todo.txt:** Do not read Todo.txt. Ignore it.

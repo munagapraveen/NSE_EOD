@@ -143,13 +143,19 @@ class SyncManager:
 
             # Create database backup after successful sync
             if sync_completed_ok:
-                try:
-                    logger.info("Sync completed successfully. Triggering automated database backup...")
-                    backup_path = create_db_backup()
-                    if backup_path:
-                        prune_old_backups(keep_count=5)
-                except Exception as backup_err:
-                    logger.warning(f"Failed to create automated backup after sync: {backup_err}")
+                from config.settings import settings
+                db_url = settings.database_url
+                if db_url.startswith("duckdb:///") or "postgresql" in db_url:
+                    try:
+                        db_type = "PostgreSQL" if "postgresql" in db_url else "DuckDB"
+                        logger.info(f"Sync completed successfully. Triggering automated {db_type} database backup...")
+                        backup_path = create_db_backup()
+                        if backup_path:
+                            prune_old_backups(keep_count=5)
+                    except Exception as backup_err:
+                        logger.warning(f"Failed to create automated backup after sync: {backup_err}")
+                else:
+                    logger.info("Sync completed successfully. (Automated local database backups are not supported for this database URL)")
 
     async def _run_sync_internal_impl(
         self,
@@ -442,9 +448,20 @@ class SyncManager:
                                 session, start_date, intermediate_end, progress_callback
                             )
                         # Last trading day: GetQuoteApi for all active stocks
-                        await self._fetch_shares_via_get_quote_api(
+                        success, failure = await self._fetch_shares_via_get_quote_api(
                             session, end_date, progress_callback
                         )
+                        total_stocks = success + failure
+                        if total_stocks > 0:
+                            if success == 0 or (failure / total_stocks) > 0.10:
+                                raise RuntimeError(
+                                    f"GetQuoteApi systemic failure: {failure} failed out of {total_stocks} stocks "
+                                    f"({success / total_stocks:.1%} success rate)."
+                                )
+                            elif failure > 0:
+                                logger.warning(f"GetQuoteApi minor failure detected: {failure} failed out of {total_stocks} stocks.")
+                                failed_stages.append("SHARES_OUTSTANDING")
+                                error_details.append(f"Shares Outstanding: partial failure ({failure} stocks failed)")
                     else:
                         # HISTORICAL / FULL SYNC:
                         # Step A — XBRL bulk: populates historical quarterly shares
@@ -452,9 +469,23 @@ class SyncManager:
                         await self._fetch_shares_for_all_stocks(session, progress_callback)
                         # Step B — GetQuoteApi: stamps last trading day with freshest issuedSize
                         #           (same final step as incremental — ensures current record is accurate).
-                        await self._fetch_shares_via_get_quote_api(
+                        success, failure = await self._fetch_shares_via_get_quote_api(
                             session, end_date, progress_callback
                         )
+                        total_stocks = success + failure
+                        if total_stocks > 0:
+                            if success == 0 or (failure / total_stocks) > 0.10:
+                                raise RuntimeError(
+                                    f"GetQuoteApi systemic failure: {failure} failed out of {total_stocks} stocks "
+                                    f"({success / total_stocks:.1%} success rate)."
+                                )
+                            elif failure > 0:
+                                logger.warning(f"GetQuoteApi minor failure detected: {failure} failed out of {total_stocks} stocks.")
+                                failed_stages.append("SHARES_OUTSTANDING")
+                                error_details.append(f"Shares Outstanding: partial failure ({failure} stocks failed)")
+                except RuntimeError as re:
+                    logger.error(f"Systemic failure in outstanding shares: {re}")
+                    raise re
                 except Exception as e:
                     logger.error(f"Failed to fetch outstanding shares: {e}")
                     failed_stages.append("SHARES_OUTSTANDING")
@@ -468,15 +499,17 @@ class SyncManager:
                 try:
                     if is_incremental:
                         logger.info("Running optimized incremental price adjustment...")
-                        await adjust_incremental_prices(session, start_date, end_date)
+                        await adjust_incremental_prices(session, start_date, end_date, progress_callback=progress_callback)
                         if missing_adj_sec_ids:
                             logger.info(f"Healing price adjustment gaps for {len(missing_adj_sec_ids)} securities...")
-                            for sec_id in missing_adj_sec_ids:
+                            for idx, sec_id in enumerate(missing_adj_sec_ids):
+                                if progress_callback:
+                                    progress_callback("PRICE_ADJUSTMENT", 80.0, f"Healing price adjustment for security ID {sec_id}...")
                                 await adjust_prices_for_security(session, sec_id)
                                 await asyncio.sleep(0.01)
                     else:
                         logger.info("Running global price adjustment...")
-                        await adjust_all_prices(session)
+                        await adjust_all_prices(session, progress_callback=progress_callback)
                 except Exception as e:
                     logger.error(f"Failed price adjustments: {e}")
                     failed_stages.append("PRICE_ADJUSTMENT")
@@ -485,26 +518,31 @@ class SyncManager:
             # 8. HISTORICAL MARKET CAP
             if self._cancel_requested: return self._cancel_summary()
             if options.get("market_cap"):
-                if progress_callback:
-                    progress_callback("MARKET_CAP", 85.0, "Calculating historical market caps...")
-                try:
-                    if is_incremental:
-                        logger.info("Running optimized incremental market cap calculations...")
-                        await calculate_incremental_market_caps_for_range(session, start_date, end_date)
-                        if missing_adj_sec_ids:
-                            logger.info(f"Healing historical market caps for {len(missing_adj_sec_ids)} securities...")
-                            for sec_id in missing_adj_sec_ids:
-                                sec = session.get(Security, sec_id)
-                                if sec and sec.security_type == "STOCK" and sec.issued_shares:
-                                    await calculate_historical_market_cap(session, sec_id, sec.issued_shares)
-                                    await asyncio.sleep(0.01)
-                    else:
-                        logger.info("Running global historical market cap calculations...")
-                        await calculate_all_historical_market_caps(session)
-                except Exception as e:
-                    logger.error(f"Failed historical market cap calculations: {e}")
+                if "SHARES_OUTSTANDING" in failed_stages:
+                    logger.error("Skipping historical market cap calculations because SHARES_OUTSTANDING stage failed.")
                     failed_stages.append("MARKET_CAP")
-                    error_details.append(f"Market Cap: {e}")
+                    error_details.append("Market Cap: Skipped due to Shares Outstanding stage failure.")
+                else:
+                    if progress_callback:
+                        progress_callback("MARKET_CAP", 85.0, "Calculating historical market caps...")
+                    try:
+                        if is_incremental:
+                            logger.info("Running optimized incremental market cap calculations...")
+                            await calculate_incremental_market_caps_for_range(session, start_date, end_date)
+                            if missing_adj_sec_ids:
+                                logger.info(f"Healing historical market caps for {len(missing_adj_sec_ids)} securities...")
+                                for sec_id in missing_adj_sec_ids:
+                                    sec = session.get(Security, sec_id)
+                                    if sec and sec.security_type == "STOCK" and sec.issued_shares:
+                                        await calculate_historical_market_cap(session, sec_id, sec.issued_shares)
+                                        await asyncio.sleep(0.01)
+                        else:
+                            logger.info("Running global historical market cap calculations...")
+                            await calculate_all_historical_market_caps(session)
+                    except Exception as e:
+                        logger.error(f"Failed historical market cap calculations: {e}")
+                        failed_stages.append("MARKET_CAP")
+                        error_details.append(f"Market Cap: {e}")
 
             # 9. TECHNICAL INDICATORS
             if self._cancel_requested: return self._cancel_summary()
@@ -843,6 +881,79 @@ class SyncManager:
                         pass  # malformed — leave NULL
 
         session.commit()
+
+        # Check and update quarterly index membership mapping (Option 2)
+        q_month = ((actual_trade_date.month - 1) // 3) * 3 + 1
+        quarter_start = date(actual_trade_date.year, q_month, 1)
+
+        from src.models import SecurityIndex
+        from sqlalchemy import func
+        
+        # Calculate active stocks count and current index distinct security count
+        active_stocks_count = len(stocks)
+        indexed_securities_count = session.query(func.count(func.distinct(SecurityIndex.security_id)))\
+            .filter(SecurityIndex.quarter_date == quarter_start).scalar() or 0
+
+        # Self-healing logic: if no records exist, or if the records are incomplete (less than 50% of active stocks)
+        is_incomplete = indexed_securities_count == 0 or (active_stocks_count > 0 and indexed_securities_count < active_stocks_count * 0.5)
+
+        if is_incomplete:
+            if indexed_securities_count > 0:
+                logger.warning(
+                    f"[GetQuoteApi] Incomplete index memberships detected for quarter {quarter_start} "
+                    f"({indexed_securities_count} indexed stocks vs {active_stocks_count} active stocks). "
+                    f"Deleting partial records and rebuilding..."
+                )
+                session.query(SecurityIndex).filter(SecurityIndex.quarter_date == quarter_start).delete()
+                session.commit()
+            else:
+                logger.info(f"[GetQuoteApi] First run of the quarter detected for {quarter_start}. Populating index memberships...")
+
+            if progress_callback:
+                progress_callback(
+                    "SHARES_OUTSTANDING", 72.0,
+                    f"[GetQuoteApi] Populating quarterly index memberships..."
+                )
+            
+            indexes_to_insert = []
+            seen_memberships = set() # to prevent UniqueConstraint violations
+
+            for stock in stocks:
+                data = results.get(stock.symbol)
+                if not data:
+                    continue
+
+                sec_info = data.get("secInfo") or {}
+                primary_index = (sec_info.get("index") or "").strip() or None
+                index_list = sec_info.get("indexList") or []
+
+                if primary_index:
+                    seen_memberships.add((stock.id, primary_index))
+                    indexes_to_insert.append({
+                        "security_id": stock.id,
+                        "quarter_date": quarter_start,
+                        "index_name": primary_index,
+                        "is_primary": True
+                    })
+
+                for idx_name in index_list:
+                    idx_name = (idx_name or "").strip()
+                    if idx_name and (stock.id, idx_name) not in seen_memberships:
+                        seen_memberships.add((stock.id, idx_name))
+                        indexes_to_insert.append({
+                            "security_id": stock.id,
+                            "quarter_date": quarter_start,
+                            "index_name": idx_name,
+                            "is_primary": False
+                        })
+
+            if indexes_to_insert:
+                session.bulk_insert_mappings(SecurityIndex, indexes_to_insert)
+                session.commit()
+                logger.info(f"[GetQuoteApi] Successfully populated {len(indexes_to_insert)} security_indexes records for quarter {quarter_start}.")
+            else:
+                logger.info("[GetQuoteApi] No index membership data available to insert.")
+
         logger.info(
             f"[GetQuoteApi] issued_shares + classification fields updated for trading date {actual_trade_date}: "
             f"{success} success, {failure} failed / no data, out of {total} total stocks."

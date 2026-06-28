@@ -66,7 +66,6 @@ async def calculate_indicators_for_security(session: Session, security_id: int) 
 
     if records:
         session.bulk_insert_mappings(Indicator, records)
-        session.commit()
 
     logger.debug(
         f"Calculated SMAs for security ID {security_id}: "
@@ -94,20 +93,18 @@ async def calculate_all_indicators(session: Session, progress_callback=None) -> 
     total_written = 0
     total = len(securities)
     for idx, sec in enumerate(securities):
-        try:
-            if progress_callback:
-                pct = 90.0 + (idx / total) * 9.0
-                progress_callback("INDICATORS", pct, f"Calculating SMA for {sec.symbol} ({idx+1}/{total})...")
-            
-            written = await calculate_indicators_for_security(session, sec.id)
-            total_written += written
-            
-            if (idx + 1) % 10 == 0 or (idx + 1) == total:
-                logger.info(f"[{idx+1}/{total}] Calculated SMAs for security {sec.symbol}: {written} records saved")
-        except Exception as e:
-            logger.error(f"Failed to calculate SMAs for security {sec.symbol} (ID: {sec.id}): {e}")
-            session.rollback()
+        if progress_callback:
+            pct = 90.0 + (idx / total) * 9.0
+            progress_callback("INDICATORS", pct, f"Calculating SMA for {sec.symbol} ({idx+1}/{total})...")
+        
+        written = await calculate_indicators_for_security(session, sec.id)
+        total_written += written
+        
+        if (idx + 1) % 10 == 0 or (idx + 1) == total:
+            logger.info(f"[{idx+1}/{total}] Calculated SMAs for security {sec.symbol}: {written} records saved")
         await asyncio.sleep(0.01)
+        
+    session.commit()
 
     logger.info(f"Global SMA indicator calculation completed. Total records written: {total_written}")
     return total_written

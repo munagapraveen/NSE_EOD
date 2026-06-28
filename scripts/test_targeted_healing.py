@@ -49,7 +49,7 @@ class TestTargetedHealing(unittest.TestCase):
         self.session.commit()
 
         # 4. Check gaps
-        adj_gaps = self.manager._find_securities_with_adj_gaps(self.session)
+        adj_gaps = self.manager._find_securities_with_adj_gaps(self.session, date(2026, 6, 2))
         self.assertEqual(adj_gaps, {sec_gap.id})
 
     def test_find_securities_with_ind_gaps(self):
@@ -72,7 +72,7 @@ class TestTargetedHealing(unittest.TestCase):
         self.session.commit()
 
         # 4. Check gaps
-        ind_gaps = self.manager._find_securities_with_ind_gaps(self.session)
+        ind_gaps = self.manager._find_securities_with_ind_gaps(self.session, date(2026, 6, 2))
         self.assertEqual(ind_gaps, {sec_gap.id})
 
     @patch("src.services.sync_manager.adjust_incremental_prices", new_callable=AsyncMock)
@@ -87,8 +87,8 @@ class TestTargetedHealing(unittest.TestCase):
     ):
         """Verify that SyncManager incremental sync runs incremental methods and heals only targeted securities with gaps."""
         # 1. Setup mock gap detection methods
-        self.manager._find_securities_with_adj_gaps = lambda s: {42}
-        self.manager._find_securities_with_ind_gaps = lambda s: {99}
+        self.manager._find_securities_with_adj_gaps = lambda s, sd: {42}
+        self.manager._find_securities_with_ind_gaps = lambda s, sd: {99}
 
         # Setup mock security for market cap query
         sec_healed = Security(id=42, symbol="HEALED", security_type="STOCK", is_active=True, issued_shares=50000000)
@@ -99,6 +99,8 @@ class TestTargetedHealing(unittest.TestCase):
 
         # Mock corporate actions sync to avoid external network calls
         self.manager.ca_service.sync_corporate_actions = AsyncMock(return_value=0)
+        # Mock shares outstanding fetch to avoid external network calls and prevent systemic failure errors
+        self.manager._fetch_shares_via_get_quote_api = AsyncMock(return_value=(1, 0))
 
         # Mock options (omit stocks, etfs, indexes to skip unnecessary downloads)
         options = {
@@ -119,7 +121,7 @@ class TestTargetedHealing(unittest.TestCase):
 
         # Verify Block 7 (Price Adjustment):
         # - adjust_incremental_prices is called
-        mock_adj_range.assert_called_once_with(self.session, date(2026, 6, 12), date(2026, 6, 12))
+        mock_adj_range.assert_called_once_with(self.session, date(2026, 6, 12), date(2026, 6, 12), progress_callback=self.manager.report_progress)
         # - adjust_prices_for_security is called for security 42
         mock_adj_sec.assert_called_once_with(self.session, 42)
 
@@ -131,7 +133,7 @@ class TestTargetedHealing(unittest.TestCase):
 
         # Verify Block 9 (Indicators):
         # - calculate_incremental_indicators_for_range is called
-        mock_calc_ind_range.assert_called_once_with(self.session, date(2026, 6, 12), date(2026, 6, 12))
+        mock_calc_ind_range.assert_called_once_with(self.session, date(2026, 6, 12), date(2026, 6, 12), progress_callback=self.manager.report_progress)
         # - calculate_indicators_for_security is called for both 42 and 99 (union of adj gaps and ind gaps)
         called_sec_ids = {call.args[1] for call in mock_calc_ind_sec.call_args_list}
         self.assertEqual(called_sec_ids, {42, 99})

@@ -17,6 +17,7 @@ def align_database_sequences(engine):
         ("symbol_changes", "symbol_changes_id_seq"),
         ("sync_log", "sync_log_id_seq"),
         ("historical_shares", "historical_shares_id_seq"),
+        ("security_indexes", "security_indexes_id_seq"),
     ]
 
     try:

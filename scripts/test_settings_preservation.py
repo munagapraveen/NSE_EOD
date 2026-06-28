@@ -69,5 +69,27 @@ class TestSettingsPreservation(unittest.TestCase):
         self.assertEqual(vars_dict["AUTO_SYNC_ENABLED"], "TRUE")
         self.assertEqual(vars_dict["AUTO_SYNC_TIME"], "18:30")
 
+    def test_save_env_settings_rejects_invalid_url(self):
+        # Run save_env_settings with an invalid database URL string
+        success = save_env_settings(
+            db_url="hello-world-invalid-db-url",
+            start_date_str="2025-06-01",
+            delay=4.0,
+            native=False,
+            dark=False
+        )
+        self.assertFalse(success)
+        
+        # Verify that the original DATABASE_URL is STILL preserved
+        vars_dict = {}
+        with open(self.env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    vars_dict[k.strip()] = v.strip()
+        self.assertEqual(vars_dict["DATABASE_URL"], "duckdb:///data/original.db")
+
+
 if __name__ == "__main__":
     unittest.main()
