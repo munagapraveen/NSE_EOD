@@ -85,6 +85,24 @@ class NSEClient:
         delay = settings.nse_request_delay_seconds
         await asyncio.sleep(delay)
 
+    # ──────────────────────────────────────────────────────────────────────────
+    #  CRITICAL ARCHITECTURAL WARNING - DO NOT MODIFY OR REVERT THE FOLLOWING
+    # ──────────────────────────────────────────────────────────────────────────
+    # FINDINGS & ALERTS (2026-06-29):
+    # 1. DO NOT REVERT TO A SINGLE PERSISTENT SESSION FOR PARALLEL QUOTES:
+    #    Reusing a single AsyncSession for concurrent requests (e.g., in fetch_all_quotes_parallel)
+    #    forces curl_cffi to multiplex requests over a single TCP connection using HTTP/2.
+    #    NSE India's Akamai Bot Manager detects this and immediately terminates the streams with
+    #    "curl: (92) HTTP/2 stream was not closed cleanly: INTERNAL_ERROR (err 2)".
+    #    To avoid this, GetQuoteApi requests MUST use `use_new_session=True` to spawn a new session
+    #    (and thus a new TCP connection/TLS handshake) per request, just like the working Codex script.
+    #
+    # 2. DO NOT REMOVE `NSE_HEADERS` FROM DEFAULT REQUESTS:
+    #    Archive and CSV downloads (e.g. bhavcopy, index close) do not specify custom headers.
+    #    If NSE_HEADERS are not merged by default in `_get`, these requests are sent without
+    #    a browser User-Agent and are blocked instantly by Akamai (403 Forbidden / Connection reset).
+    # ──────────────────────────────────────────────────────────────────────────
+
     async def _get(
         self,
         url: str,
@@ -94,6 +112,7 @@ class NSEClient:
         retries: int = None,
         accept_json: bool = False,
         bypass_rate_limit: bool = False,
+        use_new_session: bool = False,
     ):
         """
         Make a GET request with rate limiting and 403 retry via cookie refresh.
@@ -106,6 +125,7 @@ class NSEClient:
             retries: Number of retries (default: settings.nse_max_retries)
             accept_json: If True, override Accept header for API JSON calls
             bypass_rate_limit: If True, bypass the rate limit delay
+            use_new_session: If True, use a new AsyncSession for this request to avoid HTTP/2 multiplexing
 
         Returns:
             curl_cffi Response object
@@ -113,9 +133,16 @@ class NSEClient:
         if retries is None:
             retries = settings.nse_max_retries
 
+        # Ensure we always use the proper NSE headers by default (CRITICAL: Fixes broken downloads)
+        request_headers = NSE_HEADERS.copy()
+        if accept_json:
+            request_headers["Accept"] = NSE_API_ACCEPT
+        if headers:
+            request_headers.update(headers)
+
         if requires_cookies:
             await self._ensure_session()
-        else:
+        elif not use_new_session:
             # For non-cookie requests (archive downloads), a plain session is fine
             if self._session is None:
                 self._session = AsyncSession(
@@ -128,13 +155,12 @@ class NSEClient:
                 if not bypass_rate_limit:
                     await self._rate_limit()
 
-                request_headers = {}
-                if accept_json:
-                    request_headers["Accept"] = NSE_API_ACCEPT
-                if headers:
-                    request_headers.update(headers)
-
-                response = await self._session.get(url, params=params, headers=request_headers)
+                if use_new_session:
+                    # CRITICAL: Creating a new AsyncSession per request prevents HTTP/2 stream resets
+                    async with AsyncSession(impersonate=self.IMPERSONATE_BROWSER, timeout=30) as session:
+                        response = await session.get(url, params=params, headers=request_headers)
+                else:
+                    response = await self._session.get(url, params=params, headers=request_headers)
 
                 if response.status_code in (401, 403) and requires_cookies and attempt < retries:
                     logger.warning(
@@ -300,7 +326,7 @@ class NSEClient:
             orderBook  → lastPrice (post-market)
             lastUpdateTime
 
-        Requires valid NSE session cookies (requires_cookies=True).
+        Does not require cookies when using impersonated browser session and correct Referer.
 
         Args:
             symbol: NSE stock symbol (e.g., 'RELIANCE')
@@ -319,10 +345,11 @@ class NSEClient:
                 "series": series,
                 "symbol": symbol,
             },
-            requires_cookies=True,
+            requires_cookies=False,
             accept_json=True,
             headers={"Referer": f"https://www.nseindia.com/get-quote/equity/{symbol}"},
             bypass_rate_limit=bypass_rate_limit,
+            use_new_session=True,
         )
         data = response.json()
         equity_response = data.get("equityResponse") or []
@@ -330,15 +357,9 @@ class NSEClient:
             raise RuntimeError(f"Empty equityResponse for {symbol}/{series}")
             
         res_data = equity_response[0]
-        # Fallback to BE series if EQ returned all None values (indicating stock might be in BE series)
-        if series == "EQ" and res_data.get("metaData") is None:
-            logger.info(f"NSEClient: {symbol} returned empty metadata for EQ series. Retrying with BE series...")
-            try:
-                be_data = await self.fetch_get_quote_api(symbol, series="BE", bypass_rate_limit=bypass_rate_limit)
-                if be_data.get("metaData") is not None:
-                    return be_data
-            except Exception as e:
-                logger.warning(f"NSEClient: Fallback to BE series failed for {symbol}: {e}")
+        # Raise error if metadata is missing (indicating stock is not active in this series)
+        if res_data.get("metaData") is None:
+            raise RuntimeError(f"Empty metadata for {symbol}/{series}")
                 
         return res_data
 
@@ -346,19 +367,19 @@ class NSEClient:
         self,
         stocks: list[tuple[str, str]],
         workers: int = 8,
-        bypass_rate_limit: bool = False,
+        bypass_rate_limit: bool = True,
     ) -> dict[str, dict | None]:
         """
         Fetch GetQuoteApi for multiple (symbol, series) pairs concurrently.
 
-        Uses an asyncio.Semaphore to cap parallel requests to `workers` (default 8).
-        Failures per symbol are logged as warnings and recorded as None — they do
-        not abort the batch.
+        Uses a two-pass approach:
+        1. Fetches all stocks using their requested series (typically EQ).
+        2. Collects any stocks that failed (metadata is None) and retries them with BE series in batch mode.
 
         Args:
             stocks:  List of (symbol, series) tuples, e.g. [('RELIANCE', 'EQ'), ...]
-            workers: Max concurrent requests (default 8, same as Codex reference)
-            bypass_rate_limit: If False, respect the settings.nse_request_delay_seconds delay.
+            workers: Max concurrent requests (default 8)
+            bypass_rate_limit: If True, bypass the rate limit delay (recommended for speed)
 
         Returns:
             Dict keyed by symbol → equityResponse[0] dict, or None on failure.
@@ -374,10 +395,26 @@ class NSEClient:
                     logger.warning(f"[GetQuoteApi] Failed for {symbol}/{series}: {exc}")
                     return symbol, None
 
+        # Pass 1: Fetch all stocks with their requested series
         tasks = [_fetch_one(sym, ser) for sym, ser in stocks]
         for coro in asyncio.as_completed(tasks):
             sym, data = await coro
             results[sym] = data
+
+        # Pass 2: Retry failed EQ stocks using the BE series in batch mode
+        failed_eq_stocks = [
+            (sym, "BE") for sym, ser in stocks 
+            if results.get(sym) is None and ser == "EQ"
+        ]
+        
+        if failed_eq_stocks:
+            logger.info(f"Retrying {len(failed_eq_stocks)} failed EQ stocks in BE series (batch mode)...")
+            be_results = await self.fetch_all_quotes_parallel(
+                failed_eq_stocks, 
+                workers=workers, 
+                bypass_rate_limit=bypass_rate_limit
+            )
+            results.update(be_results)
 
         return results
 
